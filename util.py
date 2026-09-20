@@ -70,7 +70,7 @@ class SensorManager:
         self._world = world
         self._sensors: list[carla.Actor] = []
 
-    def add_camera(self, target: carla.Actor, offset: carla.Transform | None) -> carla.Actor:
+    def add_camera(self, target: carla.Actor, offset: carla.Transform | None = None) -> carla.Actor:
         """
         Adds an RGB camera sensor to the specified target. If the camera offset is not specified, it defaults
         """

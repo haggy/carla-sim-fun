@@ -77,7 +77,7 @@ import sys
 import weakref
 
 # Custom imports
-import util
+from module import util
 
 try:
     import pygame
@@ -1267,9 +1267,9 @@ def game_loop(args):
 
         clock = pygame.time.Clock()
 
-        sensor_manager = util.SensorManager(world)
+        sensor_manager = util.SensorManager(sim_world)
         rgb_sensor = sensor_manager.add_camera(world.player)
-        
+
         while True:
             if args.sync:
                 sim_world.tick()
