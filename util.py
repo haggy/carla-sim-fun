@@ -63,3 +63,22 @@ def move_spectator_to_vehicle(
     rotation = carla.Rotation(pitch=pitch, yaw=vt.rotation.yaw, roll=0.0)
 
     spectator.set_transform(carla.Transform(location, rotation))
+
+class SensorManager:
+
+    def __init__(self, world: carla.World):
+        self._world = world
+        self._sensors: list[carla.Actor] = []
+
+    def add_camera(self, target: carla.Actor, offset: carla.Transform | None) -> carla.Actor:
+        """
+        Adds an RGB camera sensor to the specified target. If the camera offset is not specified, it defaults
+        """
+        # Create a transform to place the camera on top of the subject
+        camera_init_trans = offset or carla.Transform(carla.Location(z=1.5))
+        camera_bp = self._world.get_blueprint_library().find('sensor.camera.rgb')
+
+        # We spawn the camera and attach it to our ego vehicle
+        camera = self._world.spawn_actor(camera_bp, camera_init_trans, attach_to=target)
+        self._sensors.append(camera)
+        return camera
