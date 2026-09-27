@@ -1324,6 +1324,9 @@ class DataCollection:
         print("Data collection processing complete. Shutting down.")
 
     def tick(self, world: World) -> None:
+        vel = world.player.get_velocity()
+        self.set_speed(3.6 * math.sqrt(vel.x**2 + vel.y**2 + vel.z**2))
+
         self.set_acceleration(*world.imu_sensor.accelerometer)
 
         if self._curr_frame.rgb_raw_image_data is None:
@@ -1352,6 +1355,9 @@ class DataCollection:
 
     def set_steer_right(self, b: bool) -> None:
         self._curr_frame.steer_right = b
+
+    def set_speed(self, s: float) -> None:
+        self._curr_frame.speed = s
 
     def set_acceleration(self, x: float = 0.0, y: float = 0.0, z: float = 0.0) -> None:
         self._curr_frame.accel_x = x
