@@ -1420,10 +1420,11 @@ class DataCollection:
 
             datasets_cache.append(next_dataset)
 
-            if (idx + 1) % 10 == 0:
-                print(f"Processed {idx + 1} / {total_frames} ({round((idx + 1) / total_frames * 100)}%)")
+            frame_num = idx + 1
+            if frame_num % 100 == 0:
+                print(f"Processed {frame_num} / {total_frames} ({round(frame_num / total_frames * 100)}%)")
 
-        print(f"Processed {idx + 1} / {total_frames} ({round((idx + 1) / total_frames * 100)}%)")
+        print(f"Processed {frame_num} / {total_frames} ({round(frame_num / total_frames * 100)}%)")
 
         print("Creating vectorized dataset")
         self._vectorized_dataset = np.concat(datasets_cache, axis=1)
