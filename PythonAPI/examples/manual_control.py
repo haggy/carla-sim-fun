@@ -1375,8 +1375,8 @@ class DataCollection:
             - The steer right state (on/off)
             - The brake state (on/off)
         
-        The last 4 rows make up the desired control state during training/validation.
-        During inference a one-hot encoded vector is produced with the predicted next control state
+        The last 4 rows make up the desired control state for training/validation (the actions for the observations)
+        During inference a one-hot encoded vector is produced with the predicted action (next control state)
         """
         total_frames = len(self._frames)
         datasets_cache: list[npt.NDArray[np.float32]] = []
