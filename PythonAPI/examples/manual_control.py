@@ -80,9 +80,11 @@ import re
 import sys
 import weakref
 
-# Custom imports
+# Custom imports / declarations
 from module import util
 from pprint import pprint
+
+DEBUG = False
 
 try:
     import pygame
@@ -1340,8 +1342,10 @@ class DataCollection:
             return
         
         self._frames.append(self._curr_frame)
-        print(f"Collected {len(self._frames)} frames")
-        pprint(self._curr_frame)
+
+        if DEBUG:
+            print(f"Collected {len(self._frames)} frames")
+            pprint(self._curr_frame)
 
         self._curr_frame = DataCollectionFrame()
 
