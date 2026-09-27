@@ -1379,6 +1379,8 @@ class DataCollection:
         During inference a one-hot encoded vector is produced with the predicted next control state
         """
         total_frames = len(self._frames)
+        datasets_cache: list[npt.NDArray[np.float32]] = []
+
         for idx, frame in enumerate(self._frames):
             next_flat_img_data = np.frombuffer(frame.rgb_raw_image_data, dtype=np.uint8)
             next_flat_img_data = next_flat_img_data.reshape((frame.rgb_img_h, frame.rgb_img_w, 4))
@@ -1416,15 +1418,15 @@ class DataCollection:
             # Concat the entire column
             next_dataset = np.concat([next_flat_img_data, movement_dynamics, controls])
 
-            if self._vectorized_dataset is None:
-                self._vectorized_dataset = next_dataset
-            else:
-                self._vectorized_dataset = np.concat([self._vectorized_dataset, next_dataset], axis=1)
+            datasets_cache.append(next_dataset)
 
             if (idx + 1) % 10 == 0:
                 print(f"Processed {idx + 1} / {total_frames} ({round((idx + 1) / total_frames * 100)}%)")
 
         print(f"Processed {idx + 1} / {total_frames} ({round((idx + 1) / total_frames * 100)}%)")
+
+        print("Creating vectorized dataset")
+        self._vectorized_dataset = np.concat(datasets_cache, axis=1)
         print(f"Shape: {self._vectorized_dataset.shape}")
 
 
