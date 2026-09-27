@@ -56,6 +56,8 @@ Use ARROWS or WASD keys for control.
 """
 
 from __future__ import print_function
+from dataclasses import dataclass
+from typing import Any, Tuple
 
 # ==============================================================================
 # -- imports -------------------------------------------------------------------
@@ -79,6 +81,7 @@ import weakref
 
 # Custom imports
 from module import util
+from pprint import pprint
 
 try:
     import pygame
@@ -385,7 +388,7 @@ class KeyboardControl(object):
         self._steer_cache = 0.0
         world.hud.notification("Press 'H' or '?' for help.", seconds=4.0)
 
-    def parse_events(self, client, world, clock, sync_mode):
+    def parse_events(self, client, world, clock, sync_mode, data_collection: "DataCollection"):
         if isinstance(self._control, carla.VehicleControl):
             current_lights = self._lights
         for event in pygame.event.get():
@@ -564,7 +567,7 @@ class KeyboardControl(object):
 
         if not self._autopilot_enabled:
             if isinstance(self._control, carla.VehicleControl):
-                self._parse_vehicle_keys(pygame.key.get_pressed(), clock.get_time())
+                self._parse_vehicle_keys(pygame.key.get_pressed(), clock.get_time(), data_collection)
                 self._control.reverse = self._control.gear < 0
                 # Set automatic control-related vehicle lights
                 if self._control.brake:
@@ -592,33 +595,41 @@ class KeyboardControl(object):
                 self._parse_walker_keys(pygame.key.get_pressed(), clock.get_time(), world)
                 world.player.apply_control(self._control)
 
-    def _parse_vehicle_keys(self, keys, milliseconds):
+    def _parse_vehicle_keys(self, keys, milliseconds, data_collection: "DataCollection"):
         if keys[K_UP] or keys[K_w]:
+            data_collection.set_throttle(True)
             if not self._ackermann_enabled:
                 self._control.throttle = min(self._control.throttle + 0.1, 1.00)
             else:
                 self._ackermann_control.speed += round(milliseconds * 0.005, 2) * self._ackermann_reverse
         else:
+            data_collection.set_throttle(False)
             if not self._ackermann_enabled:
                 self._control.throttle = 0.0
 
         if keys[K_DOWN] or keys[K_s]:
+            data_collection.set_brake(True)
             if not self._ackermann_enabled:
                 self._control.brake = min(self._control.brake + 0.2, 1)
             else:
                 self._ackermann_control.speed -= min(abs(self._ackermann_control.speed), round(milliseconds * 0.005, 2)) * self._ackermann_reverse
                 self._ackermann_control.speed = max(0, abs(self._ackermann_control.speed)) * self._ackermann_reverse
         else:
+            data_collection.set_brake(False)
             if not self._ackermann_enabled:
                 self._control.brake = 0
 
         steer_increment = 5e-4 * milliseconds
         if keys[K_LEFT] or keys[K_a]:
+            data_collection.set_steer_left(True)
+            data_collection.set_steer_right(False)
             if self._steer_cache > 0:
                 self._steer_cache = 0
             else:
                 self._steer_cache -= steer_increment
         elif keys[K_RIGHT] or keys[K_d]:
+            data_collection.set_steer_left(False)
+            data_collection.set_steer_right(True)
             if self._steer_cache < 0:
                 self._steer_cache = 0
             else:
@@ -1279,32 +1290,87 @@ class SensorPreview(object):
 # ==============================================================================
 # -- Data Collection -----------------------------------------------------------
 # ==============================================================================
+
+@dataclass
+class DataCollectionFrame:
+    """
+    Aggregates the data collected from a single frame
+    """
+    rgb_img_h: int = 0 # Image height
+    rgb_img_w: int = 0  # Image width
+    rgb_raw_image_data: memoryview | None = None
+    speed: float = 0.0
+    accel_x: float = 0.0
+    accel_y: float = 0.0
+    accel_z: float = 0.0
+    throttle: bool = False
+    brake: bool = False
+    steer_left: bool = False
+    steer_right: bool = False
+
+    
 class DataCollection:
 
-    def __init__(self, rgb_sensor_img_width: int, rgb_sensor_img_height: int):
-        self._rgb_img_width: int = rgb_sensor_img_width
-        self._rgb_img_height: int = rgb_sensor_img_height
-        self._raw_img_data_size = rgb_sensor_img_width * rgb_sensor_img_height
+    def __init__(self):
         # 2D array to capture raw RGB image data
         # Additional image data will be concatenated column-wise
         self._rgb_img_data: npt.NDArray[np.uint8] | None = None
+        self._curr_frame: DataCollectionFrame = DataCollectionFrame()
+        self._frames: list[DataCollectionFrame] = []
 
     def shutdown(self) -> None:
-        print("Data collection flushing...")
+        print("Data Collection: processing captured RGB sensor frames...")
+        self._process_rgb_img_frames()
+        print("Data collection processing complete. Shutting down.")
 
+    def tick(self, world: World) -> None:
+        self.set_acceleration(*world.imu_sensor.accelerometer)
+
+        if self._curr_frame.rgb_raw_image_data is None:
+            # Wait until we have the image data
+            return
+        
+        self._frames.append(self._curr_frame)
+        print(f"Collected {len(self._frames)} frames")
+        pprint(self._curr_frame)
+
+        self._curr_frame = DataCollectionFrame()
 
     def handle_rgb_sensor_data(self, img: carla.Image) -> None:
-        next_flat_img_data = np.frombuffer(img.raw_data, dtype=np.dtype("uint8"))
-        next_flat_img_data = next_flat_img_data.reshape((img.height, img.width, 4))
-        next_flat_img_data = next_flat_img_data[:, :, :3]  # Drop the 4th (alpha) channel
-        next_flat_img_data = next_flat_img_data[:, :, ::-1]  # Reverses the channels BGR -> RGB
-        next_flat_img_data = next_flat_img_data.reshape((-1, 1))
+        self._curr_frame.rgb_img_h = img.height
+        self._curr_frame.rgb_img_w = img.width
+        self._curr_frame.rgb_raw_image_data = img.raw_data
 
-        if self._rgb_img_data is None:
-            self._rgb_img_data = next_flat_img_data
-        else:
-            self._rgb_img_data = np.concat([self._rgb_img_data, next_flat_img_data], axis=1)
-        
+    def set_throttle(self, b: bool) -> None:
+        self._curr_frame.throttle = b
+
+    def set_brake(self, b: bool) -> None:
+        self._curr_frame.brake = b
+
+    def set_steer_left(self, b: bool) -> None:
+        self._curr_frame.steer_left = b
+
+    def set_steer_right(self, b: bool) -> None:
+        self._curr_frame.steer_right = b
+
+    def set_acceleration(self, x: float = 0.0, y: float = 0.0, z: float = 0.0) -> None:
+        self._curr_frame.accel_x = x
+        self._curr_frame.accel_y = y
+        self._curr_frame.accel_z = z
+
+    def _process_rgb_img_frames(self) -> None:
+        for frame in self._frames:
+            next_flat_img_data = np.frombuffer(frame.rgb_raw_image_data, dtype=np.dtype("uint8"))
+            next_flat_img_data = next_flat_img_data.reshape((frame.rgb_img_h, frame.rgb_img_w, 4))
+            next_flat_img_data = next_flat_img_data[:, :, :3]  # Drop the 4th (alpha) channel
+            next_flat_img_data = next_flat_img_data[:, :, ::-1]  # Reverses the channels BGR -> RGB
+            next_flat_img_data = next_flat_img_data.reshape((-1, 1))
+
+            if self._rgb_img_data is None:
+                self._rgb_img_data = next_flat_img_data
+            else:
+                self._rgb_img_data = np.concat([self._rgb_img_data, next_flat_img_data], axis=1)
+            
         print(f"Shape: {self._rgb_img_data.shape}")
 
 
@@ -1367,10 +1433,7 @@ def game_loop(args):
         preview = SensorPreview(hud, size=PREVIEW_SIZE)
         world.sensor_preview = preview
 
-        data_collection = DataCollection(
-            rgb_sensor_img_width=PREVIEW_SIZE,
-            rgb_sensor_img_height=PREVIEW_SIZE,
-        )
+        data_collection = DataCollection()
 
         def hood_transform(player):
             """Windshield view, sized off the actor like CameraManager's hood view.
@@ -1406,12 +1469,14 @@ def game_loop(args):
             if args.sync:
                 sim_world.tick()
             clock.tick_busy_loop(60)
-            if controller.parse_events(client, world, clock, args.sync):
+            if controller.parse_events(client, world, clock, args.sync, data_collection):
                 return
             # world.restart() replaces the player, taking attached sensors with it.
             if world.player.id != preview_player_id:
                 preview_player_id = world.player.id
                 attach_preview_camera(world.player)
+
+            data_collection.tick(world)
             world.tick(clock)
             world.render(display)
             pygame.display.flip()
@@ -1419,6 +1484,9 @@ def game_loop(args):
     finally:
         if sensor_manager is not None:
             sensor_manager.shutdown()
+
+        if data_collection is not None:
+            data_collection.shutdown()
         
         if original_settings:
             sim_world.apply_settings(original_settings)
