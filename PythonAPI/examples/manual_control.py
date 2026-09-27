@@ -57,6 +57,7 @@ Use ARROWS or WASD keys for control.
 
 from __future__ import print_function
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Tuple
 
 # ==============================================================================
@@ -1311,12 +1312,17 @@ class DataCollectionFrame:
     
 class DataCollection:
 
-    def __init__(self):
+    def __init__(self, data_save_dir: Path | None = None):
+        """
+        :param: data_save_dir The base directory to persist collected datasets. Defaults to CWD
+        """
         # 2D array to capture raw data
         # Additional data samples will be concatenated column-wise
         self._vectorized_dataset: npt.NDArray[np.uint8] | None = None
         self._curr_frame: DataCollectionFrame = DataCollectionFrame()
         self._frames: list[DataCollectionFrame] = []
+        self._persistance_dir = data_save_dir or Path.cwd()
+        
 
     def shutdown(self) -> None:
         print("Data Collection: processing captured data frames...")
@@ -1428,8 +1434,15 @@ class DataCollection:
 
         print("Creating vectorized dataset")
         self._vectorized_dataset = np.concat(datasets_cache, axis=1)
-        print(f"Shape: {self._vectorized_dataset.shape}")
+        print(f"Vectorized dataset created with shape: {self._vectorized_dataset.shape}")
 
+        save_path = self._persistance_dir / "captured_data.npy"
+        print(f"Saving dataset to {save_path}")
+        self._persist(save_path)
+
+
+    def _persist(self, save_path: Path) -> None:
+        np.save(save_path, self._vectorized_dataset)
 
 
 # ==============================================================================
@@ -1490,7 +1503,10 @@ def game_loop(args):
         preview = SensorPreview(hud, size=PREVIEW_SIZE)
         world.sensor_preview = preview
 
-        data_collection = DataCollection()
+        # Save to the base modules dir
+        data_collection = DataCollection(
+            data_save_dir=Path(__file__).resolve().parent.parent.parent
+        )
 
         def hood_transform(player):
             """Windshield view, sized off the actor like CameraManager's hood view.
