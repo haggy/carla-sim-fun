@@ -1,4 +1,5 @@
 from decimal import Decimal
+from typing import Tuple
 
 import carla
 import random
@@ -70,9 +71,19 @@ class SensorManager:
         self._world = world
         self._sensors: list[carla.Actor] = []
 
-    def add_camera(self, target: carla.Actor, offset: carla.Transform | None = None) -> carla.Actor:
+    def shutdown(self) -> None:
+        for s in self._sensors:
+            if s.is_alive:
+                if s.is_listening:
+                    s.stop()
+                s.destroy()
+
+        self._sensors.clear()
+
+    def add_rgb_camera(self, target: carla.Actor, offset: carla.Transform | None = None) -> Tuple[carla.Actor, int]:
         """
-        Adds an RGB camera sensor to the specified target. If the camera offset is not specified, it defaults
+        Adds an RGB camera sensor to the specified target. If the camera offset is not specified, it defaults to offset above.
+        Returns the sensor and the index (for later referencing)
         """
         # Create a transform to place the camera on top of the subject
         camera_init_trans = offset or carla.Transform(carla.Location(z=1.5))
@@ -80,5 +91,13 @@ class SensorManager:
 
         # We spawn the camera and attach it to our ego vehicle
         camera = self._world.spawn_actor(camera_bp, camera_init_trans, attach_to=target)
+
+        sensor_idx = len(self._sensors)
         self._sensors.append(camera)
-        return camera
+        return camera, sensor_idx
+
+    def add_listener(self, sensor_idx: int, callback_fn) -> None:
+        if sensor_idx < 0 or sensor_idx > len(self._sensors) - 1:
+            raise Exception("Invalid sensor ID")
+
+        self._sensors[sensor_idx].listen(callback_fn)

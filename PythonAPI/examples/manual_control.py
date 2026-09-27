@@ -1267,8 +1267,12 @@ def game_loop(args):
 
         clock = pygame.time.Clock()
 
+        def handle_forward_cam_sensor_data(img: carla.Image) -> None:
+            print(f"FOV: {img.fov} W: {img.width} H: {img.height}")
+        
         sensor_manager = util.SensorManager(sim_world)
-        rgb_sensor = sensor_manager.add_camera(world.player)
+        _, rgb_sensor_idx = sensor_manager.add_rgb_camera(world.player)
+        sensor_manager.add_listener(rgb_sensor_idx, handle_forward_cam_sensor_data)
 
         while True:
             if args.sync:
@@ -1281,7 +1285,8 @@ def game_loop(args):
             pygame.display.flip()
 
     finally:
-
+        sensor_manager.shutdown()
+        
         if original_settings:
             sim_world.apply_settings(original_settings)
 
