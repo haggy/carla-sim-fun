@@ -1312,15 +1312,15 @@ class DataCollectionFrame:
 class DataCollection:
 
     def __init__(self):
-        # 2D array to capture raw RGB image data
-        # Additional image data will be concatenated column-wise
-        self._rgb_img_data: npt.NDArray[np.uint8] | None = None
+        # 2D array to capture raw data
+        # Additional data samples will be concatenated column-wise
+        self._vectorized_dataset: npt.NDArray[np.uint8] | None = None
         self._curr_frame: DataCollectionFrame = DataCollectionFrame()
         self._frames: list[DataCollectionFrame] = []
 
     def shutdown(self) -> None:
-        print("Data Collection: processing captured RGB sensor frames...")
-        self._process_rgb_img_frames()
+        print("Data Collection: processing captured data frames...")
+        self._process_data_frames()
         print("Data collection processing complete. Shutting down.")
 
     def tick(self, world: World) -> None:
@@ -1358,20 +1358,63 @@ class DataCollection:
         self._curr_frame.accel_y = y
         self._curr_frame.accel_z = z
 
-    def _process_rgb_img_frames(self) -> None:
+    def _process_data_frames(self) -> None:
+        """
+        Creates a 2D numpy matrix where each column contains:
+            - The flattened raw image data (in RGB format, alpha layer dropped)
+            - The speed
+            - The acceleration (x, y, z)
+            - The throttle state (on/off)
+            - The steer left state (on/off)
+            - The steer right state (on/off)
+            - The brake state (on/off)
+        
+        The last 4 rows make up the desired control state during training/validation.
+        During inference a one-hot encoded vector is produced with the predicted next control state
+        """
         for frame in self._frames:
-            next_flat_img_data = np.frombuffer(frame.rgb_raw_image_data, dtype=np.dtype("uint8"))
+            next_flat_img_data = np.frombuffer(frame.rgb_raw_image_data, dtype=np.uint8)
             next_flat_img_data = next_flat_img_data.reshape((frame.rgb_img_h, frame.rgb_img_w, 4))
             next_flat_img_data = next_flat_img_data[:, :, :3]  # Drop the 4th (alpha) channel
             next_flat_img_data = next_flat_img_data[:, :, ::-1]  # Reverses the channels BGR -> RGB
             next_flat_img_data = next_flat_img_data.reshape((-1, 1))
 
-            if self._rgb_img_data is None:
-                self._rgb_img_data = next_flat_img_data
+            # speed and acceleration vector
+            movement_dynamics = np.fromiter([frame.speed, frame.accel_x, frame.accel_y, frame.accel_z], dtype=np.float32)
+            movement_dynamics = movement_dynamics.reshape((-1, 1))
+
+            # We implement some constraints on the control output
+            # We enforce that throttle and brake make no sense to enable at the same time 
+            # We enforce that only left or right steering is active at the same time
+            # State index: [throttle, steer left, steer right, brake]
+            # TODO: Remove the magic indices below
+            controls = np.fromiter(
+                [int(frame.throttle), int(frame.steer_left), int(frame.steer_right), int(frame.brake)], 
+                dtype=np.float32
+            )
+
+            if frame.throttle and frame.brake:
+                # Take the safe option and apply the brake
+                controls[0] = 0.0
+                controls[3] = 1.0
+
+            if frame.steer_left and frame.steer_right:
+                # Set left to random value and make right the opposite
+                steer_left = random.randint(0, 1)
+                controls[1] = float(steer_left)
+                controls[2] = float(steer_left ^ 1)
+
+            controls = controls.reshape((-1, 1))
+
+            # Concat the entire column
+            next_dataset = np.concat([next_flat_img_data, movement_dynamics, controls])
+
+            if self._vectorized_dataset is None:
+                self._vectorized_dataset = next_dataset
             else:
-                self._rgb_img_data = np.concat([self._rgb_img_data, next_flat_img_data], axis=1)
+                self._vectorized_dataset = np.concat([self._vectorized_dataset, next_dataset], axis=1)
             
-        print(f"Shape: {self._rgb_img_data.shape}")
+        print(f"Shape: {self._vectorized_dataset.shape}")
 
 
 
