@@ -50,6 +50,7 @@ Use ARROWS or WASD keys for control.
     CTRL + -     : decrements the start time of the replay by 1 second (+SHIFT = 10 seconds)
 
     F1           : toggle HUD
+    F2           : toggle forward camera preview
     H/?          : toggle help
     ESC          : quit
 """
@@ -91,6 +92,7 @@ try:
     from pygame.locals import K_DOWN
     from pygame.locals import K_ESCAPE
     from pygame.locals import K_F1
+    from pygame.locals import K_F2
     from pygame.locals import K_LEFT
     from pygame.locals import K_PERIOD
     from pygame.locals import K_RIGHT
@@ -196,6 +198,7 @@ class World(object):
         self.imu_sensor = None
         self.radar_sensor = None
         self.camera_manager = None
+        self.sensor_preview = None
         self._weather_presets = find_weather_presets()
         self._weather_index = 0
         self._actor_filter = args.filter
@@ -329,6 +332,8 @@ class World(object):
 
     def render(self, display):
         self.camera_manager.render(display)
+        if self.sensor_preview is not None:
+            self.sensor_preview.render(display)
         self.hud.render(display)
 
     def destroy_sensors(self):
@@ -397,6 +402,9 @@ class KeyboardControl(object):
                         world.restart()
                 elif event.key == K_F1:
                     world.hud.toggle_info()
+                elif event.key == K_F2:
+                    if world.sensor_preview is not None:
+                        world.sensor_preview.toggle_preview()
                 elif event.key == K_v and pygame.key.get_mods() & KMOD_SHIFT:
                     world.next_map_layer(reverse=True)
                 elif event.key == K_v:
@@ -1219,6 +1227,53 @@ class CameraManager(object):
 
 
 # ==============================================================================
+# -- SensorPreview -------------------------------------------------------------
+# ==============================================================================
+
+
+class SensorPreview(object):
+    """Small square preview pane for an extra camera sensor, inset bottom-right."""
+
+    def __init__(self, hud, size=320, margin=16, border=2):
+        self.hud = hud
+        # Clamp to the window: at --res 640x360 an unclamped 320 pane lands off-screen.
+        self.size = min(size, hud.dim[0] // 3, hud.dim[1] // 2)
+        self.surface = None
+        self._show_preview = True
+        # Bottom-right, lifted clear of the HUD's full-width notification band.
+        self.pos = (hud.dim[0] - self.size - margin,
+                    hud.dim[1] - self.size - margin - 40)
+        self._frame_rect = pygame.Rect(
+            self.pos[0] - border, self.pos[1] - border,
+            self.size + 2 * border, self.size + 2 * border)
+        self._border = border
+
+    def toggle_preview(self):
+        self._show_preview = not self._show_preview
+        self.hud.notification('Forward camera preview %s'
+                              % ('On' if self._show_preview else 'Off'))
+
+    def parse_image(self, image):
+        # Runs on a CARLA sensor thread. image.raw_data is only valid for the
+        # duration of this call, so make_surface (which copies) has to happen here.
+        array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
+        array = np.reshape(array, (image.height, image.width, 4))
+        array = array[:, :, :3]
+        array = array[:, :, ::-1]
+        self.surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
+
+    def render(self, display):
+        if not self._show_preview:
+            return
+        # Matte first, so the pane reads as an empty inset box for the frame or two
+        # before the camera delivers its first image (and right after a re-attach).
+        pygame.draw.rect(display, (0, 0, 0), self._frame_rect)
+        if self.surface is not None:
+            display.blit(self.surface, self.pos)
+        pygame.draw.rect(display, (255, 255, 255), self._frame_rect, self._border)
+
+
+# ==============================================================================
 # -- game_loop() ---------------------------------------------------------------
 # ==============================================================================
 
@@ -1228,6 +1283,7 @@ def game_loop(args):
     pygame.font.init()
     world = None
     original_settings = None
+    sensor_manager = None
     
     try:
         client = carla.Client(args.host, args.port)
@@ -1267,12 +1323,41 @@ def game_loop(args):
 
         clock = pygame.time.Clock()
 
-        def handle_forward_cam_sensor_data(img: carla.Image) -> None:
-            print(f"FOV: {img.fov} W: {img.width} H: {img.height}")
-        
+        PREVIEW_SIZE = 320
+
         sensor_manager = util.SensorManager(sim_world)
-        _, rgb_sensor_idx = sensor_manager.add_rgb_camera(world.player)
-        sensor_manager.add_listener(rgb_sensor_idx, handle_forward_cam_sensor_data)
+        preview = SensorPreview(hud, size=PREVIEW_SIZE)
+        world.sensor_preview = preview
+
+        def hood_transform(player):
+            """Windshield view, sized off the actor like CameraManager's hood view.
+
+            A fixed metric offset sits inside the mesh on vans and trucks, and
+            --filter vehicle.* picks a different vehicle every run.
+            """
+            if player.type_id.startswith("walker.pedestrian"):
+                return carla.Transform(carla.Location(x=1.6, z=1.7))
+            bound_x = 0.5 + player.bounding_box.extent.x
+            bound_z = 0.5 + player.bounding_box.extent.z
+            return carla.Transform(carla.Location(x=0.8 * bound_x, z=1.3 * bound_z))
+
+        def attach_preview_camera(player):
+            """Spawn the forward preview camera on `player` and feed the pane."""
+            preview.surface = None
+            _, idx = sensor_manager.add_rgb_camera(
+                player,
+                offset=hood_transform(player),
+                attributes={
+                    'image_size_x': preview.size,
+                    'image_size_y': preview.size,
+                    'fov': 90,
+                    'gamma': args.gamma,
+                },
+            )
+            sensor_manager.add_listener(idx, preview.parse_image)
+
+        attach_preview_camera(world.player)
+        preview_player_id = world.player.id
 
         while True:
             if args.sync:
@@ -1280,12 +1365,17 @@ def game_loop(args):
             clock.tick_busy_loop(60)
             if controller.parse_events(client, world, clock, args.sync):
                 return
+            # world.restart() replaces the player, taking attached sensors with it.
+            if world.player.id != preview_player_id:
+                preview_player_id = world.player.id
+                attach_preview_camera(world.player)
             world.tick(clock)
             world.render(display)
             pygame.display.flip()
 
     finally:
-        sensor_manager.shutdown()
+        if sensor_manager is not None:
+            sensor_manager.shutdown()
         
         if original_settings:
             sim_world.apply_settings(original_settings)

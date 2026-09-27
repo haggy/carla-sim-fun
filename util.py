@@ -73,21 +73,35 @@ class SensorManager:
 
     def shutdown(self) -> None:
         for s in self._sensors:
-            if s.is_alive:
-                if s.is_listening:
-                    s.stop()
-                s.destroy()
+            try:
+                if s.is_alive:
+                    if s.is_listening:
+                        s.stop()
+                    s.destroy()
+            except RuntimeError:
+                # Already destroyed server-side (e.g. its parent actor died first);
+                # is_alive is a client-side flag and can be stale after a cascade.
+                pass
 
         self._sensors.clear()
 
-    def add_rgb_camera(self, target: carla.Actor, offset: carla.Transform | None = None) -> Tuple[carla.Actor, int]:
+    def add_rgb_camera(
+            self,
+            target: carla.Actor,
+            offset: carla.Transform | None = None,
+            attributes: dict[str, str] | None = None,
+        ) -> Tuple[carla.Actor, int]:
         """
         Adds an RGB camera sensor to the specified target. If the camera offset is not specified, it defaults to offset above.
+        Optional blueprint attributes (image_size_x, fov, gamma, ...) are applied before spawning.
         Returns the sensor and the index (for later referencing)
         """
         # Create a transform to place the camera on top of the subject
         camera_init_trans = offset or carla.Transform(carla.Location(z=1.5))
         camera_bp = self._world.get_blueprint_library().find('sensor.camera.rgb')
+
+        for attr_name, attr_value in (attributes or {}).items():
+            camera_bp.set_attribute(attr_name, str(attr_value))
 
         # We spawn the camera and attach it to our ego vehicle
         camera = self._world.spawn_actor(camera_bp, camera_init_trans, attach_to=target)
