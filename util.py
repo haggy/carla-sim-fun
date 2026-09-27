@@ -110,8 +110,39 @@ class SensorManager:
         self._sensors.append(camera)
         return camera, sensor_idx
 
-    def add_listener(self, sensor_idx: int, callback_fn) -> None:
+    def add_listener(self, sensor_idx: int, *callback_fn) -> None:
+        """
+        Adds any number of listeners to the given sensor.
+        NOTE: Functions are called serially in order, synchronously
+        """
         if sensor_idx < 0 or sensor_idx > len(self._sensors) - 1:
             raise Exception("Invalid sensor ID")
 
-        self._sensors[sensor_idx].listen(callback_fn)
+        # Recursive function composition to support any number of 
+        # callbacks for the sensor data. This does not support chained
+        # return values (each function is independent and isolated)
+        def _cb(remaining_callbacks, cb_chain=None):
+            if not remaining_callbacks:
+                return cb_chain
+            
+            if not cb_chain:
+                # First execution
+                cb_chain = remaining_callbacks[0]
+
+                if len(remaining_callbacks) > 1:
+                    return _cb(remaining_callbacks[1:], cb_chain)
+                else: return cb_chain
+
+            # There is an existing callback chain so we compose fn's
+            def _wrapped(data) -> None:
+                cb_chain(data)
+                next_fn = remaining_callbacks[0]
+                next_fn(data)
+
+            if len(remaining_callbacks) > 1:
+                return _cb(remaining_callbacks[1:], _wrapped)
+            else: return _wrapped
+
+
+
+        self._sensors[sensor_idx].listen(_cb(callback_fn))

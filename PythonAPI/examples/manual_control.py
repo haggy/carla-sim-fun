@@ -128,8 +128,9 @@ except ImportError:
 
 try:
     import numpy as np
+    import numpy.typing as npt
 except ImportError:
-    raise RuntimeError('cannot import numpy, make sure numpy package is installed')
+    raise RuntimeError('cannot import numpy and/or np typing, make sure numpy package is installed')
 
 
 # ==============================================================================
@@ -1257,9 +1258,11 @@ class SensorPreview(object):
         # Runs on a CARLA sensor thread. image.raw_data is only valid for the
         # duration of this call, so make_surface (which copies) has to happen here.
         array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
+
+        # Carla images have 4 channels per pixel
         array = np.reshape(array, (image.height, image.width, 4))
-        array = array[:, :, :3]
-        array = array[:, :, ::-1]
+        array = array[:, :, :3]  # Drop the 4th (alpha) channel
+        array = array[:, :, ::-1]  # Reverses the channels BGR -> RGB
         self.surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
 
     def render(self, display):
@@ -1274,6 +1277,39 @@ class SensorPreview(object):
 
 
 # ==============================================================================
+# -- Data Collection -----------------------------------------------------------
+# ==============================================================================
+class DataCollection:
+
+    def __init__(self, rgb_sensor_img_width: int, rgb_sensor_img_height: int):
+        self._rgb_img_width: int = rgb_sensor_img_width
+        self._rgb_img_height: int = rgb_sensor_img_height
+        self._raw_img_data_size = rgb_sensor_img_width * rgb_sensor_img_height
+        # 2D array to capture raw RGB image data
+        # Additional image data will be concatenated column-wise
+        self._rgb_img_data: npt.NDArray[np.uint8] | None = None
+
+    def shutdown(self) -> None:
+        print("Data collection flushing...")
+
+
+    def handle_rgb_sensor_data(self, img: carla.Image) -> None:
+        next_flat_img_data = np.frombuffer(img.raw_data, dtype=np.dtype("uint8"))
+        next_flat_img_data = next_flat_img_data.reshape((img.height, img.width, 4))
+        next_flat_img_data = next_flat_img_data[:, :, :3]  # Drop the 4th (alpha) channel
+        next_flat_img_data = next_flat_img_data[:, :, ::-1]  # Reverses the channels BGR -> RGB
+        next_flat_img_data = next_flat_img_data.reshape((-1, 1))
+
+        if self._rgb_img_data is None:
+            self._rgb_img_data = next_flat_img_data
+        else:
+            self._rgb_img_data = np.concat([self._rgb_img_data, next_flat_img_data], axis=1)
+        
+        print(f"Shape: {self._rgb_img_data.shape}")
+
+
+
+# ==============================================================================
 # -- game_loop() ---------------------------------------------------------------
 # ==============================================================================
 
@@ -1283,7 +1319,8 @@ def game_loop(args):
     pygame.font.init()
     world = None
     original_settings = None
-    sensor_manager = None
+    sensor_manager: util.SensorManager | None = None
+    data_collection: DataCollection | None = None
     
     try:
         client = carla.Client(args.host, args.port)
@@ -1326,8 +1363,14 @@ def game_loop(args):
         PREVIEW_SIZE = 320
 
         sensor_manager = util.SensorManager(sim_world)
+
         preview = SensorPreview(hud, size=PREVIEW_SIZE)
         world.sensor_preview = preview
+
+        data_collection = DataCollection(
+            rgb_sensor_img_width=PREVIEW_SIZE,
+            rgb_sensor_img_height=PREVIEW_SIZE,
+        )
 
         def hood_transform(player):
             """Windshield view, sized off the actor like CameraManager's hood view.
@@ -1354,7 +1397,7 @@ def game_loop(args):
                     'gamma': args.gamma,
                 },
             )
-            sensor_manager.add_listener(idx, preview.parse_image)
+            sensor_manager.add_listener(idx, data_collection.handle_rgb_sensor_data, preview.parse_image)
 
         attach_preview_camera(world.player)
         preview_player_id = world.player.id
