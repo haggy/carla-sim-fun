@@ -1378,7 +1378,8 @@ class DataCollection:
         The last 4 rows make up the desired control state during training/validation.
         During inference a one-hot encoded vector is produced with the predicted next control state
         """
-        for frame in self._frames:
+        total_frames = len(self._frames)
+        for idx, frame in enumerate(self._frames):
             next_flat_img_data = np.frombuffer(frame.rgb_raw_image_data, dtype=np.uint8)
             next_flat_img_data = next_flat_img_data.reshape((frame.rgb_img_h, frame.rgb_img_w, 4))
             next_flat_img_data = next_flat_img_data[:, :, :3]  # Drop the 4th (alpha) channel
@@ -1419,7 +1420,11 @@ class DataCollection:
                 self._vectorized_dataset = next_dataset
             else:
                 self._vectorized_dataset = np.concat([self._vectorized_dataset, next_dataset], axis=1)
-            
+
+            if (idx + 1) % 10 == 0:
+                print(f"Processed {idx + 1} / {total_frames} ({round((idx + 1) / total_frames * 100)}%)")
+
+        print(f"Processed {idx + 1} / {total_frames} ({round((idx + 1) / total_frames * 100)}%)")
         print(f"Shape: {self._vectorized_dataset.shape}")
 
 
