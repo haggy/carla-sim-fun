@@ -38,9 +38,7 @@ class ClassificationNetwork(torch.nn.Module):
         observation:   torch.Tensor of size (batch_size, height, width, channel)
         return         torch.Tensor of size (batch_size, C)
         """
-        logits = self._network(observation)
-        prediction = self._softmax(logits)
-        return prediction
+        return self._network(observation)
 
     def actions_to_classes(self, actions):
         """

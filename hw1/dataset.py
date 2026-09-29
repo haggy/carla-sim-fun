@@ -28,7 +28,7 @@ class CarlaDataset(Dataset):
         ])
 
         self.transform_action = transforms.Compose([
-            transforms.ToTensor(),
+            #transforms.ToTensor(),
         ])
 
     def __len__(self):
@@ -44,8 +44,9 @@ class CarlaDataset(Dataset):
         sample: npt.NDArray[np.float32] = self._vectorized_data[:, idx].reshape((-1, 1))
 
         # Split the observation from the actions
-        observation = self.transform_obs(sample[:-4, :])
-        action = self.transform_action(sample[-4:, :])
+        observation = sample[:-8, :].reshape(320, 320, 3)
+        observation = self.transform_obs(observation)
+        action = torch.from_numpy(sample[-4:, :].squeeze())
 
         return observation, action
 
