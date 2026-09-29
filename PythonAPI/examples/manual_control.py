@@ -84,7 +84,7 @@ import weakref
 from module import util
 from pprint import pprint
 
-from module.hw1.network import ClassificationNetwork
+from module.hw1.network import ClassificationNetwork, IMG_HEIGHT, IMG_WIDTH
 
 DEBUG = False
 
@@ -1266,20 +1266,27 @@ class CameraManager(object):
 
 
 class SensorPreview(object):
-    """Small square preview pane for an extra camera sensor, inset bottom-right."""
+    """Preview pane for an extra camera sensor, inset bottom-right.
 
-    def __init__(self, hud, size=320, margin=16, border=2):
+    The pane mirrors the sensor's own resolution (320x240 per HW1 s1.5), so the
+    frame is blitted 1:1 with no scaling.
+    """
+
+    def __init__(self, hud, width=IMG_WIDTH, height=IMG_HEIGHT, margin=16, border=2):
         self.hud = hud
-        # Clamp to the window: at --res 640x360 an unclamped 320 pane lands off-screen.
-        self.size = min(size, hud.dim[0] // 3, hud.dim[1] // 2)
+        # Clamp to the window while preserving aspect: at --res 640x360 an
+        # unclamped pane would land off-screen.
+        scale = min(1.0, (hud.dim[0] // 3) / width, (hud.dim[1] // 2) / height)
+        self.width = int(width * scale)
+        self.height = int(height * scale)
         self.surface = None
         self._show_preview = True
         # Bottom-right, lifted clear of the HUD's full-width notification band.
-        self.pos = (hud.dim[0] - self.size - margin,
-                    hud.dim[1] - self.size - margin - 40)
+        self.pos = (hud.dim[0] - self.width - margin,
+                    hud.dim[1] - self.height - margin - 40)
         self._frame_rect = pygame.Rect(
             self.pos[0] - border, self.pos[1] - border,
-            self.size + 2 * border, self.size + 2 * border)
+            self.width + 2 * border, self.height + 2 * border)
         self._border = border
 
     def toggle_preview(self):
@@ -1524,7 +1531,8 @@ def game_loop(args):
     original_settings = None
     sensor_manager: util.SensorManager | None = None
     data_collection: DataCollection | None = None
-    
+    model: ClassificationNetwork | None = None
+
     try:
         client = carla.Client(args.host, args.port)
         client.set_timeout(2000.0)
@@ -1563,14 +1571,15 @@ def game_loop(args):
 
         clock = pygame.time.Clock()
 
-        PREVIEW_SIZE = 320
 
         sensor_manager = util.SensorManager(sim_world)
 
-        preview = SensorPreview(hud, size=PREVIEW_SIZE)
+        preview = SensorPreview(hud, width=IMG_WIDTH, height=IMG_HEIGHT)
         world.sensor_preview = preview
 
-        model = ClassificationNetwork.load_and_eval(Path("/home/dave/school/engec517/carla/model.pth"))
+        if args.model_path is not None:
+            model = ClassificationNetwork.load_and_eval(Path(args.model_path))
+            
         # Save to the base modules dir
         data_collection = DataCollection(
             data_save_dir=Path(__file__).resolve().parent.parent.parent,
@@ -1596,8 +1605,8 @@ def game_loop(args):
                 player,
                 offset=hood_transform(player),
                 attributes={
-                    'image_size_x': preview.size,
-                    'image_size_y': preview.size,
+                    'image_size_x': IMG_WIDTH,
+                    'image_size_y': IMG_HEIGHT,
                     'fov': 90,
                     'gamma': args.gamma,
                 },
@@ -1699,6 +1708,9 @@ def main():
         '--sync',
         action='store_true',
         help='Activate synchronous mode execution')
+    argparser.add_argument(
+            '--model_path',
+            help='Use trained inference model given at <path> to drive the vehicle')
     args = argparser.parse_args()
 
     args.width, args.height = [int(x) for x in args.res.split('x')]

@@ -13,18 +13,23 @@ def conv_out(size, kernel_size, stride):
 def _get_avail_device() -> torch.device:
     return torch.accelerator.current_accelerator() or torch.device("cpu")
 
+# Observation size mandated by the homework (HW1 s1.5): 320 wide by 240 high.
+# Arrays are therefore (H, W, C) = (240, 320, 3).
+IMG_WIDTH = 320
+IMG_HEIGHT = 240
+
+
 class ClassificationNetwork(torch.nn.Module):
-    # TODO: Change this to match the assignment spec!
-    def __init__(self, img_height: int = 320, img_width: int = 320):
+    def __init__(self, img_height: int = IMG_HEIGHT, img_width: int = IMG_WIDTH):
         """
         Implementation of the network layers. The image size of the input
-        observations is 320x240 pixels.
+        observations is 320x240 pixels (width x height).
         """
         super().__init__()
 
         # Calculate the final linear input size based on multiple 2D convolutions
-        h = conv_out(conv_out(img_height, 5, 2), 3, 1)   # 320 -> 158 -> 156
-        w = conv_out(conv_out(img_width,  5, 2), 3, 1)
+        h = conv_out(conv_out(img_height, 5, 2), 3, 1)   # 240 -> 118 -> 116
+        w = conv_out(conv_out(img_width,  5, 2), 3, 1)   # 320 -> 158 -> 156
         
         self._network = nn.Sequential(
             nn.Conv2d(in_channels=3, out_channels=32, kernel_size=5, stride=2),
