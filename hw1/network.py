@@ -1,9 +1,17 @@
+from pathlib import Path
+
 import torch
 import torch.nn as nn
-
+import torch.functional as F
+import numpy as np
+import numpy.typing as npt
+import torchvision
 
 def conv_out(size, kernel_size, stride):
     return (size - kernel_size) // stride + 1
+
+def _get_avail_device() -> torch.device:
+    return torch.accelerator.current_accelerator() or torch.device("cpu")
 
 class ClassificationNetwork(torch.nn.Module):
     # TODO: Change this to match the assignment spec!
@@ -50,7 +58,7 @@ class ClassificationNetwork(torch.nn.Module):
         actions:        python list of N torch.Tensors of size 3
         return          python list of N torch.Tensors of size C
         """
-        pass
+        return self._softmax(actions)
 
     def scores_to_action(self, scores):
         """
@@ -61,5 +69,21 @@ class ClassificationNetwork(torch.nn.Module):
         return          (float, float, float)
         """
         pass
+
+    def numpy_img_to_tensor(self, img_in: npt.NDArray[np.float32], copy: bool = False) -> torch.Tensor:
+        """
+        img_in: float32 (C, H, W)
+        return  float32 (C, H, W) image tensor
+        """
+        return torchvision.transforms.functional.to_tensor(img_in).to(self.get_device())
+
+    def get_device(self) -> torch.device:
+        return _get_avail_device()
+
+    @staticmethod
+    def load_and_eval(model_path: Path) -> "ClassificationNetwork":
+        model = torch.load(model_path, weights_only=False, map_location=_get_avail_device())
+        model.eval()
+        return model
 
 
