@@ -1320,7 +1320,7 @@ class DataCollectionFrame:
     """
     rgb_img_h: int = 0 # Image height
     rgb_img_w: int = 0  # Image width
-    rgb_raw_image_data: memoryview | None = None
+    rgb_raw_image_data: npt.NDArray[np.uint8] | None = None
     speed: float = 0.0
     accel_x: float = 0.0
     accel_y: float = 0.0
@@ -1402,7 +1402,7 @@ class DataCollection:
     def handle_rgb_sensor_data(self, img: carla.Image) -> None:
         self._curr_frame.rgb_img_h = img.height
         self._curr_frame.rgb_img_w = img.width
-        self._curr_frame.rgb_raw_image_data = img.raw_data
+        self._curr_frame.rgb_raw_image_data = np.frombuffer(img.raw_data, dtype=np.uint8).copy()
 
     def set_throttle(self, b: bool) -> None:
         self._curr_frame.throttle = b
@@ -1445,8 +1445,7 @@ class DataCollection:
         datasets_cache: list[npt.NDArray[np.float32]] = []
 
         for idx, frame in enumerate(self._frames):
-            next_flat_img_data = np.frombuffer(frame.rgb_raw_image_data, dtype=np.uint8)
-            next_flat_img_data = next_flat_img_data.reshape((frame.rgb_img_h, frame.rgb_img_w, 4))
+            next_flat_img_data = frame.rgb_raw_image_data.reshape((frame.rgb_img_h, frame.rgb_img_w, 4))
             next_flat_img_data = next_flat_img_data[:, :, :3]  # Drop the 4th (alpha) channel
             next_flat_img_data = next_flat_img_data[:, :, ::-1]  # Reverses the channels BGR -> RGB
             next_flat_img_data = next_flat_img_data.reshape((-1, 1))
