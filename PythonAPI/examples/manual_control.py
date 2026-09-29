@@ -1445,6 +1445,18 @@ class DataCollection:
         datasets_cache: list[npt.NDArray[np.float32]] = []
 
         for idx, frame in enumerate(self._frames):
+            frame_num = idx + 1
+
+            # Ignore any frames without any control input
+            if not (
+                frame.throttle or
+                frame.steer_left or
+                frame.steer_right or
+                frame.brake
+            ):
+                print("Ignoring frame wth no control input")
+                continue
+
             next_flat_img_data = frame.rgb_raw_image_data.reshape((frame.rgb_img_h, frame.rgb_img_w, 4))
             next_flat_img_data = next_flat_img_data[:, :, :3]  # Drop the 4th (alpha) channel
             next_flat_img_data = next_flat_img_data[:, :, ::-1]  # Reverses the channels BGR -> RGB
@@ -1482,7 +1494,6 @@ class DataCollection:
 
             datasets_cache.append(next_dataset)
 
-            frame_num = idx + 1
             if frame_num % 100 == 0:
                 print(f"Processed {frame_num} / {total_frames} ({round(frame_num / total_frames * 100)}%)")
 
