@@ -5,7 +5,6 @@ import torch.nn as nn
 import torch.functional as F
 import numpy as np
 import numpy.typing as npt
-import torchvision
 
 def conv_out(size, kernel_size, stride):
     return (size - kernel_size) // stride + 1
@@ -17,6 +16,24 @@ def _get_avail_device() -> torch.device:
 # Arrays are therefore (H, W, C) = (240, 320, 3).
 IMG_WIDTH = 320
 IMG_HEIGHT = 240
+
+# Images are stored on disk as uint8 (0-255) and scaled to [0,1] here. Every
+# consumer - training, the pygame inference loop and the benchmark agent - MUST
+# go through image_to_tensor so the model never sees a different input range
+# than it was trained on.
+PIXEL_SCALE = 255.0
+
+
+def image_to_tensor(img_hwc) -> torch.Tensor:
+    """
+    Convert one RGB observation into the tensor layout the network expects.
+
+    img_hwc: (H, W, 3) numpy array, uint8 0-255 or float carrying 0-255 values
+    return   (3, H, W) float32 tensor scaled to [0, 1]
+    """
+    arr = np.ascontiguousarray(img_hwc)
+    tensor = torch.from_numpy(arr.astype(np.float32, copy=False) / PIXEL_SCALE)
+    return tensor.permute(2, 0, 1)
 
 # Action-classes (HW1 s1.2b). Each class decodes to one (steer, throttle, brake)
 # triple, matching carla.VehicleControl: steer is a single signed value where
@@ -70,6 +87,9 @@ class ClassificationNetwork(torch.nn.Module):
 
         self._softmax = nn.Softmax(dim=1)
 
+        self._ct = 0.0
+        self._cs = 0.0
+
     def forward(self, observation):
         """
         The forward pass of the network. Returns the prediction for the given
@@ -117,18 +137,50 @@ class ClassificationNetwork(torch.nn.Module):
         return    (steer, throttle, brake), ordered to match carla.VehicleControl
                   and the unpacking in team_code/test_agent.py
         """
+        # torch.load does not call __init__. Initialise lazily rather than crashing
+        self.reset_smoothing(force=False)
+
         # argmax is invariant under softmax, so this works on logits directly.
         idx = int(scores.reshape(-1, NR_OF_CLASSES).argmax(dim=-1)[0])
         steer, throttle, brake = ACTION_CLASSES[idx]
 
-        return float(steer) * 0.5, float(throttle) * 0.5, float(brake)
+        if throttle > 0.0:
+            self._ct = min(self._ct + 1e-1, 1.0)
+        else:
+            self._ct = 0.0
+
+        steer_coeff = 0.1
+        if steer > 0.0:
+            self._cs = min(self._cs + steer_coeff, 0.7)
+        elif steer < 0.0:
+            self._cs = max(self._cs - steer_coeff, -0.7)
+        else:
+            # Steer is back to 0 so converge to that
+            delta = steer_coeff * (-1 if self._cs > 0.0 else 1)
+            self._cs =  max(self._cs + delta, 0.0)
+
+        return float(self._cs), float(self._ct), float(brake)
+
+    def reset_smoothing(self, force: bool = True) -> None:
+        """
+        Zero the ramped throttle/steer state used by scores_to_action.
+
+        force=True  always resets - call at the start of each episode/rollout so
+                    one run cannot inherit the previous run's momentum.
+        force=False only fills in fields that are missing, which is what
+                    scores_to_action needs for checkpoints that predate them.
+        """
+        if force or not hasattr(self, "_ct"):
+            self._ct = 0.0
+        if force or not hasattr(self, "_cs"):
+            self._cs = 0.0
 
     def numpy_img_to_tensor(self, img_in: npt.NDArray[np.float32], copy: bool = False) -> torch.Tensor:
         """
-        img_in: float32 (C, H, W)
-        return  float32 (C, H, W) image tensor
+        img_in: (H, W, 3) uint8 or float array holding 0-255 pixel values
+        return  float32 (3, H, W) tensor scaled to [0, 1], on this model's device
         """
-        return torchvision.transforms.functional.to_tensor(img_in).to(self.get_device())
+        return image_to_tensor(img_in).to(self.get_device())
 
     def get_device(self) -> torch.device:
         return _get_avail_device()

@@ -1391,9 +1391,9 @@ class DataCollection:
             next_flat_img_data = next_flat_img_data.reshape((frame.rgb_img_h, frame.rgb_img_w, 4))
             next_flat_img_data = next_flat_img_data[:, :, :3]  # Drop the 4th (alpha) channel
             next_flat_img_data = next_flat_img_data[:, :, ::-1]  # Reverses the channels BGR -> RGB
-            next_flat_img_data = next_flat_img_data.astype(np.float32)
 
             # unsqueeze necessary to add to a "batch" of 1 for forward pass
+            # numpy_img_to_tensor applies the SAME /255 scaling training uses.
             img_tensor = self._brain.numpy_img_to_tensor(next_flat_img_data).unsqueeze(0)
             scores = self._brain(img_tensor)
             steer, throttle, brake = self._brain.scores_to_action(scores)
@@ -1448,77 +1448,98 @@ class DataCollection:
 
     def _process_data_frames(self) -> None:
         """
-        Creates a 2D numpy matrix where each column contains:
-            - The flattened raw image data (in RGB format, alpha layer dropped)
-            - The speed
-            - The acceleration (x, y, z)
-            - The steer amount (signed: negative left, positive right)
-            - The throttle amount
-            - The brake amount
+        Writes each batch as a PAIR of numpy files, because an ndarray is
+        homogeneous and the pixels and the float observations need different
+        dtypes:
 
-        The last 3 rows make up the desired control state for training/validation (the actions for the observations)
-        During inference a one-hot encoded vector is produced with the predicted action (next control state)
+            captured_data_<n>_img.npy   uint8   (H*W*3, frames)
+                the flattened RGB image, alpha dropped
+
+            captured_data_<n>_meta.npy  float32 (7, frames)
+                row 0   speed
+                rows1-3 acceleration (x, y, z)
+                rows4-6 steer (signed: negative left, positive right), throttle, brake
+
+        Storing the pixels as uint8 rather than promoting them to float32 makes
+        the dataset 4x smaller and lossless - the values are integral 0-255.
+        The last 3 meta rows are the desired control state (the actions for the
+        observations).
         """
         total_frames = len(self._frames)
-        datasets_cache: list[npt.NDArray[np.float32]] = []
+        img_cache: list[npt.NDArray[np.uint8]] = []
+        meta_cache: list[npt.NDArray[np.float32]] = []
         error_count = 0
         frame_num = 0
+        batch_num = 0
+        batch_size = 20000  # Number of frames to process per batch
 
-        for idx, frame in enumerate(self._frames):
-            
-            try:
-                next_flat_img_data = frame.rgb_raw_image_data.reshape((frame.rgb_img_h, frame.rgb_img_w, 4))
-                next_flat_img_data = next_flat_img_data[:, :, :3]  # Drop the 4th (alpha) channel
-                next_flat_img_data = next_flat_img_data[:, :, ::-1]  # Reverses the channels BGR -> RGB
-                next_flat_img_data = next_flat_img_data.reshape((-1, 1))
+        for i in range(0, total_frames, batch_size):
+            batch_num += 1
+            next_batch = self._frames[i:i+batch_size]
+            print(f"Processing batch of {len(next_batch)} frames")
 
-                # speed and acceleration vector
-                movement_dynamics = np.fromiter([frame.speed, frame.accel_x, frame.accel_y, frame.accel_z], dtype=np.float32)
-                movement_dynamics = movement_dynamics.reshape((-1, 1))
+            for idx, frame in enumerate(next_batch):
+                
+                try:
+                    next_flat_img_data = frame.rgb_raw_image_data.reshape((frame.rgb_img_h, frame.rgb_img_w, 4))
+                    next_flat_img_data = next_flat_img_data[:, :, :3]  # Drop the 4th (alpha) channel
+                    next_flat_img_data = next_flat_img_data[:, :, ::-1]  # Reverses the channels BGR -> RGB
+                    # Keep the pixels as uint8; promoting them to float32 here is
+                    # what previously quadrupled the dataset for no added precision.
+                    next_flat_img_data = next_flat_img_data.reshape((-1, 1)).astype(np.uint8)
 
-                # The expert's raw control triple, in carla.VehicleControl order.
-                # Discretising into action-classes happens at training time via
-                # ClassificationNetwork.actions_to_classes, so the stored data keeps
-                # full steering magnitude and stays usable for a regression variant.
-                # State index: [steer, throttle, brake]
-                controls = np.fromiter(
-                    [frame.steer, frame.throttle, frame.brake],
-                    dtype=np.float32
-                )
+                    # speed and acceleration vector
+                    movement_dynamics = np.fromiter([frame.speed, frame.accel_x, frame.accel_y, frame.accel_z], dtype=np.float32)
+                    movement_dynamics = movement_dynamics.reshape((-1, 1))
 
-                if frame.throttle > 0.0 and frame.brake > 0.0:
-                    # Throttle and brake together make no sense; take the safe option.
-                    controls[1] = 0.0
-                    controls[2] = 1.0
+                    # The expert's raw control triple, in carla.VehicleControl order.
+                    # Discretising into action-classes happens at training time via
+                    # ClassificationNetwork.actions_to_classes, so the stored data keeps
+                    # full steering magnitude and stays usable for a regression variant.
+                    # State index: [steer, throttle, brake]
+                    controls = np.fromiter(
+                        [frame.steer, frame.throttle, frame.brake],
+                        dtype=np.float32
+                    )
 
-                controls = controls.reshape((-1, 1))
+                    if frame.throttle > 0.0 and frame.brake > 0.0:
+                        # Throttle and brake together make no sense; take the safe option.
+                        controls[1] = 0.0
+                        controls[2] = 1.0
 
-                # Concat the entire column
-                next_dataset = np.concat([next_flat_img_data, movement_dynamics, controls])
+                    controls = controls.reshape((-1, 1))
 
-                datasets_cache.append(next_dataset)
-                frame_num += 1
-            except ValueError as ve:
-                print(f"Encountered value error: {ve}")
-                error_count +=1 
+                    # Two columns, one per dtype, kept in lockstep by index.
+                    img_cache.append(next_flat_img_data)
+                    meta_cache.append(np.concat([movement_dynamics, controls]))
+                    frame_num += 1
+                except ValueError as ve:
+                    print(f"Encountered value error: {ve}")
+                    error_count +=1 
 
-            if idx % 100 == 0:
-                print(f"Processed {frame_num} / {total_frames} ({round(frame_num / total_frames * 100)}%)")
+                if idx % 100 == 0:
+                    print(f"Processed {frame_num} / {total_frames} ({round(frame_num / total_frames * 100)}%)")
 
-        print(f"Processed {frame_num} / {total_frames} ({round(frame_num / total_frames * 100)}%)."
-               f"{error_count} errors ({round(error_count / total_frames * 100)}%)")
+            print(f"Processed {frame_num} / {total_frames} ({round(frame_num / total_frames * 100)}%)."
+                f"{error_count} errors ({round(error_count / total_frames * 100)}%)")
 
-        print("Creating vectorized dataset")
-        self._vectorized_dataset = np.concat(datasets_cache, axis=1)
-        print(f"Vectorized dataset created with shape: {self._vectorized_dataset.shape}")
+            print("Creating vectorized dataset")
+            img_dataset = np.concat(img_cache, axis=1)
+            meta_dataset = np.concat(meta_cache, axis=1)
+            print(f"Vectorized dataset created. images {img_dataset.shape} ({img_dataset.dtype}), "
+                  f"meta {meta_dataset.shape} ({meta_dataset.dtype})")
 
-        save_path = self._persistance_dir / "captured_data.npy"
-        print(f"Saving dataset to {save_path}")
-        self._persist(save_path)
+            img_path = self._persistance_dir / f"captured_data_{batch_num}_img.npy"
+            meta_path = self._persistance_dir / f"captured_data_{batch_num}_meta.npy"
+            print(f"Saving dataset to {img_path} and {meta_path}")
+            np.save(img_path, img_dataset)
+            np.save(meta_path, meta_dataset)
 
-
-    def _persist(self, save_path: Path) -> None:
-        np.save(save_path, self._vectorized_dataset)
+            img_dataset = None
+            meta_dataset = None
+            img_cache.clear()
+            meta_cache.clear()
+        
 
 
 # ==============================================================================
