@@ -32,9 +32,17 @@ ACTION_CLASSES: tuple[tuple[float, float, float], ...] = (
 )
 NR_OF_CLASSES = len(ACTION_CLASSES)
 
-# Below this magnitude the expert's steering counts as "straight". The keyboard
-# expert produces steer in 0.1 steps capped at +-0.7 (manual_control.py).
+# Thresholds that discretise a continuous expert control into action-classes.
+# These must suit BOTH experts:
+#   keyboard  - steer in 0.1 steps capped at +-0.7; throttle/brake are 0 or 1
+#   autopilot - steer is bimodal (p50 0.0006, p95 0.062, max 0.38) and
+#               throttle/brake are continuous (throttle mean 0.36, max 0.85)
+# 0.05 sits in the autopilot's natural gap between "straight" and a real turn.
 STEER_DEADZONE = 0.05
+# A low gas threshold matters for autopilot: >0.5 would label 65% of genuinely
+# accelerating frames as coasting, since its throttle averages only 0.36.
+THROTTLE_THRESHOLD = 0.1
+BRAKE_THRESHOLD = 0.5
 
 
 class ClassificationNetwork(torch.nn.Module):
@@ -82,9 +90,8 @@ class ClassificationNetwork(torch.nn.Module):
             actions = actions.unsqueeze(0)
 
         steer, throttle, brake = actions[:, 0], actions[:, 1], actions[:, 2]
-
-        braking = brake > 0.5
-        gas = throttle > 0.5
+        braking = brake > BRAKE_THRESHOLD
+        gas = throttle > THROTTLE_THRESHOLD
         left = steer < -STEER_DEADZONE
         right = steer > STEER_DEADZONE
         straight = ~left & ~right
@@ -113,7 +120,8 @@ class ClassificationNetwork(torch.nn.Module):
         # argmax is invariant under softmax, so this works on logits directly.
         idx = int(scores.reshape(-1, NR_OF_CLASSES).argmax(dim=-1)[0])
         steer, throttle, brake = ACTION_CLASSES[idx]
-        return float(steer), float(throttle), float(brake)
+
+        return float(steer) * 0.5, float(throttle) * 0.5, float(brake)
 
     def numpy_img_to_tensor(self, img_in: npt.NDArray[np.float32], copy: bool = False) -> torch.Tensor:
         """

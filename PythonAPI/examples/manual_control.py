@@ -581,14 +581,30 @@ class KeyboardControl(object):
         if not self._autopilot_enabled:
             if isinstance(self._control, carla.VehicleControl):
                 inferred = data_collection.get_next_inferred_control()
-                if inferred is not None:
+                keys = pygame.key.get_pressed()
+                # Is the human actively driving? _parse_vehicle_keys zeroes
+                # throttle/brake/steer whenever its keys are up, so running it
+                # unconditionally would wipe the model's control before it is
+                # ever applied. Only hand over when a driving key is really held.
+                human_driving = (
+                    keys[K_UP] or keys[K_w] or keys[K_DOWN] or keys[K_s] or
+                    keys[K_LEFT] or keys[K_a] or keys[K_RIGHT] or keys[K_d] or
+                    keys[K_SPACE]
+                )
+
+                if inferred is not None and not human_driving:
                     # Model is driving: take its control verbatim.
                     self._control.steer = inferred.steer
                     self._control.throttle = inferred.throttle
                     self._control.brake = inferred.brake
+                    self._control.hand_brake = False
+                    # Keep the manual steering ramp neutral so a takeover starts
+                    # from centre instead of inheriting a stale cache.
+                    self._steer_cache = 0.0
+                else:
+                    # Allow the user to take control to help the model when required
+                    self._parse_vehicle_keys(keys, clock.get_time(), data_collection)
 
-                # Allow the user to take control to help the model when required
-                self._parse_vehicle_keys(pygame.key.get_pressed(), clock.get_time(), data_collection)
                 # We capture everything because data is not persisted if the model is controlling the vehicle
                 data_collection.set_control(self._control)
                     
@@ -1387,6 +1403,13 @@ class DataCollection:
             if DEBUG:
                 print(f"inferred: steer={steer:+.2f} throttle={throttle:.2f} brake={brake:.2f}")
             return
+
+        # Read the control the vehicle actually ran with this frame. get_control()
+        # reports the last control applied to the actor whatever applied it, so
+        # this covers every driver: keyboard expert, the model, AND the autopilot
+        # (--autopilot / P). KeyboardControl.parse_events cannot cover autopilot
+        # because its whole control block sits inside `if not autopilot_enabled`.
+        self.set_control(world.player.get_control())
 
         vel = world.player.get_velocity()
         self.set_speed(3.6 * math.sqrt(vel.x**2 + vel.y**2 + vel.z**2))
