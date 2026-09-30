@@ -396,15 +396,10 @@ class KeyboardControl(object):
         self._infer_mode = infer_mode
 
     def _get_events(self, data_collection: "DataCollection") -> list[pygame.event.Event]:
-        events = []
-        
-        inferred_action = data_collection.get_next_inferred_action()
-        if inferred_action is not None:
-            events.append(inferred_action)
-
-        events.extend(pygame.event.get())
-        
-        return events
+        # The model no longer drives via synthetic key events: a keypress cannot
+        # express a continuous steer value. Its control is applied directly in
+        # parse_events instead.
+        return pygame.event.get()
     
     def parse_events(self, client, world, clock, sync_mode, data_collection: "DataCollection"):
         if isinstance(self._control, carla.VehicleControl):
@@ -585,7 +580,18 @@ class KeyboardControl(object):
 
         if not self._autopilot_enabled:
             if isinstance(self._control, carla.VehicleControl):
+                inferred = data_collection.get_next_inferred_control()
+                if inferred is not None:
+                    # Model is driving: take its control verbatim.
+                    self._control.steer = inferred.steer
+                    self._control.throttle = inferred.throttle
+                    self._control.brake = inferred.brake
+
+                # Allow the user to take control to help the model when required
                 self._parse_vehicle_keys(pygame.key.get_pressed(), clock.get_time(), data_collection)
+                # We capture everything because data is not persisted if the model is controlling the vehicle
+                data_collection.set_control(self._control)
+                    
                 self._control.reverse = self._control.gear < 0
                 # Set automatic control-related vehicle lights
                 if self._control.brake:
@@ -614,44 +620,32 @@ class KeyboardControl(object):
                 world.player.apply_control(self._control)
 
     def _parse_vehicle_keys(self, keys, milliseconds, data_collection: "DataCollection"):
-        def _is_inferred_key_activated(keycode: int) -> bool:
-            inferred_action = data_collection.get_next_inferred_action()
-            return inferred_action is not None and inferred_action.key == keycode
-        
-        if keys[K_UP] or keys[K_w] or _is_inferred_key_activated(K_w):
-            data_collection.set_throttle(True)
+        if keys[K_UP] or keys[K_w]:
             if not self._ackermann_enabled:
                 self._control.throttle = min(self._control.throttle + 0.1, 1.00)
             else:
                 self._ackermann_control.speed += round(milliseconds * 0.005, 2) * self._ackermann_reverse
         else:
-            data_collection.set_throttle(False)
             if not self._ackermann_enabled:
                 self._control.throttle = 0.0
 
-        if keys[K_DOWN] or keys[K_s] or _is_inferred_key_activated(K_s):
-            data_collection.set_brake(True)
+        if keys[K_DOWN] or keys[K_s]:
             if not self._ackermann_enabled:
                 self._control.brake = min(self._control.brake + 0.2, 1)
             else:
                 self._ackermann_control.speed -= min(abs(self._ackermann_control.speed), round(milliseconds * 0.005, 2)) * self._ackermann_reverse
                 self._ackermann_control.speed = max(0, abs(self._ackermann_control.speed)) * self._ackermann_reverse
         else:
-            data_collection.set_brake(False)
             if not self._ackermann_enabled:
                 self._control.brake = 0
 
         steer_increment = 5e-4 * milliseconds
-        if keys[K_LEFT] or keys[K_a] or _is_inferred_key_activated(K_a):
-            data_collection.set_steer_left(True)
-            data_collection.set_steer_right(False)
+        if keys[K_LEFT] or keys[K_a]:
             if self._steer_cache > 0:
                 self._steer_cache = 0
             else:
                 self._steer_cache -= steer_increment
-        elif keys[K_RIGHT] or keys[K_d] or _is_inferred_key_activated(K_d):
-            data_collection.set_steer_left(False)
-            data_collection.set_steer_right(True)
+        elif keys[K_RIGHT] or keys[K_d]:
             if self._steer_cache < 0:
                 self._steer_cache = 0
             else:
@@ -1332,10 +1326,11 @@ class DataCollectionFrame:
     accel_x: float = 0.0
     accel_y: float = 0.0
     accel_z: float = 0.0
-    throttle: bool = False
-    brake: bool = False
-    steer_left: bool = False
-    steer_right: bool = False
+    # Expert control signal, straight from carla.VehicleControl.
+    # steer is a single signed value: negative left, positive right, 0 straight.
+    steer: float = 0.0
+    throttle: float = 0.0
+    brake: float = 0.0
 
     
 class DataCollection:
@@ -1355,10 +1350,8 @@ class DataCollection:
         self._brain = brain
         self._infer_mode = brain is not None
         
-        # Stores the action -> KeyBind mapping
-        self._action_class_to_key = [K_w, K_a, K_d, K_s]
-        # Stores the inferred next action from the model when in inference mode
-        self._next_action: pygame.event.Event | None = None
+        # Stores the inferred control from the model when in inference mode
+        self._next_control: "carla.VehicleControl | None" = None
         
 
     def shutdown(self) -> None:
@@ -1386,11 +1379,13 @@ class DataCollection:
 
             # unsqueeze necessary to add to a "batch" of 1 for forward pass
             img_tensor = self._brain.numpy_img_to_tensor(next_flat_img_data).unsqueeze(0)
-            pred = self._brain(img_tensor)
-            next_action = self._brain.actions_to_classes(pred).argmax().item()
+            scores = self._brain(img_tensor)
+            steer, throttle, brake = self._brain.scores_to_action(scores)
 
-            self._next_action = pygame.event.Event(pygame.KEYUP, {"key": self._action_class_to_key[next_action]})
-            print(self._next_action)
+            self._next_control = carla.VehicleControl(
+                steer=steer, throttle=throttle, brake=brake)
+            if DEBUG:
+                print(f"inferred: steer={steer:+.2f} throttle={throttle:.2f} brake={brake:.2f}")
             return
 
         vel = world.player.get_velocity()
@@ -1411,17 +1406,11 @@ class DataCollection:
         self._curr_frame.rgb_img_w = img.width
         self._curr_frame.rgb_raw_image_data = np.frombuffer(img.raw_data, dtype=np.uint8).copy()
 
-    def set_throttle(self, b: bool) -> None:
-        self._curr_frame.throttle = b
-
-    def set_brake(self, b: bool) -> None:
-        self._curr_frame.brake = b
-
-    def set_steer_left(self, b: bool) -> None:
-        self._curr_frame.steer_left = b
-
-    def set_steer_right(self, b: bool) -> None:
-        self._curr_frame.steer_right = b
+    def set_control(self, control: carla.VehicleControl) -> None:
+        """Record the expert's actual control output for this frame."""
+        self._curr_frame.steer = float(control.steer)
+        self._curr_frame.throttle = float(control.throttle)
+        self._curr_frame.brake = float(control.brake)
 
     def set_speed(self, s: float) -> None:
         self._curr_frame.speed = s
@@ -1431,8 +1420,8 @@ class DataCollection:
         self._curr_frame.accel_y = y
         self._curr_frame.accel_z = z
 
-    def get_next_inferred_action(self) -> pygame.event.Event | None:
-        return self._next_action
+    def get_next_inferred_control(self) -> "carla.VehicleControl | None":
+        return self._next_control
 
     def _process_data_frames(self) -> None:
         """
@@ -1440,71 +1429,61 @@ class DataCollection:
             - The flattened raw image data (in RGB format, alpha layer dropped)
             - The speed
             - The acceleration (x, y, z)
-            - The throttle state (on/off)
-            - The steer left state (on/off)
-            - The steer right state (on/off)
-            - The brake state (on/off)
-        
-        The last 4 rows make up the desired control state for training/validation (the actions for the observations)
+            - The steer amount (signed: negative left, positive right)
+            - The throttle amount
+            - The brake amount
+
+        The last 3 rows make up the desired control state for training/validation (the actions for the observations)
         During inference a one-hot encoded vector is produced with the predicted action (next control state)
         """
         total_frames = len(self._frames)
         datasets_cache: list[npt.NDArray[np.float32]] = []
+        error_count = 0
+        frame_num = 0
 
         for idx, frame in enumerate(self._frames):
-            frame_num = idx + 1
+            
+            try:
+                next_flat_img_data = frame.rgb_raw_image_data.reshape((frame.rgb_img_h, frame.rgb_img_w, 4))
+                next_flat_img_data = next_flat_img_data[:, :, :3]  # Drop the 4th (alpha) channel
+                next_flat_img_data = next_flat_img_data[:, :, ::-1]  # Reverses the channels BGR -> RGB
+                next_flat_img_data = next_flat_img_data.reshape((-1, 1))
 
-            # Ignore any frames without any control input
-            if not (
-                frame.throttle or
-                frame.steer_left or
-                frame.steer_right or
-                frame.brake
-            ):
-                print("Ignoring frame wth no control input")
-                continue
+                # speed and acceleration vector
+                movement_dynamics = np.fromiter([frame.speed, frame.accel_x, frame.accel_y, frame.accel_z], dtype=np.float32)
+                movement_dynamics = movement_dynamics.reshape((-1, 1))
 
-            next_flat_img_data = frame.rgb_raw_image_data.reshape((frame.rgb_img_h, frame.rgb_img_w, 4))
-            next_flat_img_data = next_flat_img_data[:, :, :3]  # Drop the 4th (alpha) channel
-            next_flat_img_data = next_flat_img_data[:, :, ::-1]  # Reverses the channels BGR -> RGB
-            next_flat_img_data = next_flat_img_data.reshape((-1, 1))
+                # The expert's raw control triple, in carla.VehicleControl order.
+                # Discretising into action-classes happens at training time via
+                # ClassificationNetwork.actions_to_classes, so the stored data keeps
+                # full steering magnitude and stays usable for a regression variant.
+                # State index: [steer, throttle, brake]
+                controls = np.fromiter(
+                    [frame.steer, frame.throttle, frame.brake],
+                    dtype=np.float32
+                )
 
-            # speed and acceleration vector
-            movement_dynamics = np.fromiter([frame.speed, frame.accel_x, frame.accel_y, frame.accel_z], dtype=np.float32)
-            movement_dynamics = movement_dynamics.reshape((-1, 1))
+                if frame.throttle > 0.0 and frame.brake > 0.0:
+                    # Throttle and brake together make no sense; take the safe option.
+                    controls[1] = 0.0
+                    controls[2] = 1.0
 
-            # We implement some constraints on the control output
-            # We enforce that throttle and brake make no sense to enable at the same time 
-            # We enforce that only left or right steering is active at the same time
-            # State index: [throttle, steer left, steer right, brake]
-            # TODO: Remove the magic indices below
-            controls = np.fromiter(
-                [int(frame.throttle), int(frame.steer_left), int(frame.steer_right), int(frame.brake)], 
-                dtype=np.float32
-            )
+                controls = controls.reshape((-1, 1))
 
-            if frame.throttle and frame.brake:
-                # Take the safe option and apply the brake
-                controls[0] = 0.0
-                controls[3] = 1.0
+                # Concat the entire column
+                next_dataset = np.concat([next_flat_img_data, movement_dynamics, controls])
 
-            if frame.steer_left and frame.steer_right:
-                # Set left to random value and make right the opposite
-                steer_left = random.randint(0, 1)
-                controls[1] = float(steer_left)
-                controls[2] = float(steer_left ^ 1)
+                datasets_cache.append(next_dataset)
+                frame_num += 1
+            except ValueError as ve:
+                print(f"Encountered value error: {ve}")
+                error_count +=1 
 
-            controls = controls.reshape((-1, 1))
-
-            # Concat the entire column
-            next_dataset = np.concat([next_flat_img_data, movement_dynamics, controls])
-
-            datasets_cache.append(next_dataset)
-
-            if frame_num % 100 == 0:
+            if idx % 100 == 0:
                 print(f"Processed {frame_num} / {total_frames} ({round(frame_num / total_frames * 100)}%)")
 
-        print(f"Processed {frame_num} / {total_frames} ({round(frame_num / total_frames * 100)}%)")
+        print(f"Processed {frame_num} / {total_frames} ({round(frame_num / total_frames * 100)}%)."
+               f"{error_count} errors ({round(error_count / total_frames * 100)}%)")
 
         print("Creating vectorized dataset")
         self._vectorized_dataset = np.concat(datasets_cache, axis=1)

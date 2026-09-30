@@ -10,6 +10,11 @@ from torch.utils.data import Dataset
 
 from module.hw1.network import IMG_HEIGHT, IMG_WIDTH
 
+# Non-image rows per sample: 4 movement dynamics + 3 controls (steer, throttle, brake)
+NR_DYNAMICS_ROWS = 4
+NR_ACTION_ROWS = 3
+NR_EXTRA_ROWS = NR_DYNAMICS_ROWS + NR_ACTION_ROWS
+
 
 class CarlaDataset(Dataset):
     def __init__(self, data_dir):
@@ -45,10 +50,11 @@ class CarlaDataset(Dataset):
         """
         sample: npt.NDArray[np.float32] = self._vectorized_data[:, idx].reshape((-1, 1))
 
-        # Split the observation from the actions
-        observation = sample[:-8, :].reshape(IMG_HEIGHT, IMG_WIDTH, 3)
+        # Column layout: [image | speed, accel x/y/z | steer, throttle, brake]
+        # so there are NR_EXTRA_ROWS non-image rows and the action is the last 3.
+        observation = sample[:-NR_EXTRA_ROWS, :].reshape(IMG_HEIGHT, IMG_WIDTH, 3)
         observation = self.transform_obs(observation)
-        action = torch.from_numpy(sample[-4:, :].squeeze())
+        action = torch.from_numpy(sample[-NR_ACTION_ROWS:, :].squeeze().copy())
 
         return observation, action
 

@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from module.hw1.network import ClassificationNetwork
+from module.hw1.network import ClassificationNetwork, NR_OF_CLASSES
 from module.hw1.dataset import get_dataloader
 
 
@@ -22,7 +22,7 @@ def train(data_folder, save_path):
 
     nr_epochs = 100
     batch_size = 64
-    nr_of_classes = 4  # needs to be changed
+    nr_of_classes = NR_OF_CLASSES
     start_time = time.time()
 
     train_loader = get_dataloader(data_folder, batch_size)
@@ -40,6 +40,9 @@ def train(data_folder, save_path):
             batch_in, batch_gt = batch[0].to(gpu), batch[1].to(gpu)
 
             batch_out = infer_action(batch_in)
+            # batch_gt holds the expert's raw (steer, throttle, brake) triple;
+            # discretise it into one-hot action-classes for the loss.
+            batch_gt = infer_action.actions_to_classes(batch_gt)
             loss = cross_entropy_loss(batch_out, batch_gt)
 
             optimizer.zero_grad()

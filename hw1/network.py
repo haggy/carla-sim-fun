@@ -18,6 +18,24 @@ def _get_avail_device() -> torch.device:
 IMG_WIDTH = 320
 IMG_HEIGHT = 240
 
+# Action-classes (HW1 s1.2b). Each class decodes to one (steer, throttle, brake)
+# triple, matching carla.VehicleControl: steer is a single signed value where
+# negative is left, positive is right and 0.0 is straight.
+ACTION_CLASSES: tuple[tuple[float, float, float], ...] = (
+    ( 0.0, 0.0, 0.0),   # 0 straight + coast
+    ( 0.0, 1.0, 0.0),   # 1 straight + gas
+    (-0.5, 1.0, 0.0),   # 2 left     + gas
+    ( 0.5, 1.0, 0.0),   # 3 right    + gas
+    (-0.5, 0.0, 0.0),   # 4 left     + coast
+    ( 0.5, 0.0, 0.0),   # 5 right    + coast
+    ( 0.0, 0.0, 1.0),   # 6 brake
+)
+NR_OF_CLASSES = len(ACTION_CLASSES)
+
+# Below this magnitude the expert's steering counts as "straight". The keyboard
+# expert produces steer in 0.1 steps capped at +-0.7 (manual_control.py).
+STEER_DEADZONE = 0.05
+
 
 class ClassificationNetwork(torch.nn.Module):
     def __init__(self, img_height: int = IMG_HEIGHT, img_width: int = IMG_WIDTH):
@@ -39,7 +57,7 @@ class ClassificationNetwork(torch.nn.Module):
             nn.BatchNorm2d(num_features=32),
             nn.ReLU(),
             nn.Flatten(),
-            nn.Linear(32 * h * w, 4),
+            nn.Linear(32 * h * w, NR_OF_CLASSES),
         )
 
         self._softmax = nn.Softmax(dim=1)
@@ -53,27 +71,49 @@ class ClassificationNetwork(torch.nn.Module):
         """
         return self._network(observation)
 
-    def actions_to_classes(self, actions):
+    def actions_to_classes(self, actions: torch.Tensor) -> torch.Tensor:
         """
-        For a given set of actions map every action to its corresponding
-        action-class representation. Assume there are C different classes, then
-        every action is represented by a C-dim vector which has exactly one
-        non-zero entry (one-hot encoding). That index corresponds to the class
-        number.
-        actions:        python list of N torch.Tensors of size 3
-        return          python list of N torch.Tensors of size C
-        """
-        return self._softmax(actions)
+        Map every expert action to its one-hot action-class representation.
 
-    def scores_to_action(self, scores):
+        actions:  torch.Tensor of size (N, 3) - (steer, throttle, brake)
+        return    torch.Tensor of size (N, C) - one-hot, C = NR_OF_CLASSES
         """
-        Maps the scores predicted by the network to an action-class and returns
-        the corresponding action [accelaration, steering, braking].
-                        C = number of classes
-        scores:         python list of torch.Tensors of size C
-        return          (float, float, float)
+        if actions.dim() == 1:
+            actions = actions.unsqueeze(0)
+
+        steer, throttle, brake = actions[:, 0], actions[:, 1], actions[:, 2]
+
+        braking = brake > 0.5
+        gas = throttle > 0.5
+        left = steer < -STEER_DEADZONE
+        right = steer > STEER_DEADZONE
+        straight = ~left & ~right
+
+        # Defaults to class 0 (straight + coast); braking overrides everything,
+        # so a frame that brakes while steering is still labelled "brake".
+        idx = torch.zeros(actions.shape[0], dtype=torch.long, device=actions.device)
+        idx[straight & gas] = 1
+        idx[left & gas] = 2
+        idx[right & gas] = 3
+        idx[left & ~gas] = 4
+        idx[right & ~gas] = 5
+        idx[braking] = 6
+
+        return torch.nn.functional.one_hot(idx, NR_OF_CLASSES).float()
+
+    def scores_to_action(self, scores: torch.Tensor) -> tuple[float, float, float]:
         """
-        pass
+        Map the scores predicted by the network to an action-class and return
+        the corresponding action.
+
+        scores:   torch.Tensor of size (C,) or (1, C) - logits or probabilities
+        return    (steer, throttle, brake), ordered to match carla.VehicleControl
+                  and the unpacking in team_code/test_agent.py
+        """
+        # argmax is invariant under softmax, so this works on logits directly.
+        idx = int(scores.reshape(-1, NR_OF_CLASSES).argmax(dim=-1)[0])
+        steer, throttle, brake = ACTION_CLASSES[idx]
+        return float(steer), float(throttle), float(brake)
 
     def numpy_img_to_tensor(self, img_in: npt.NDArray[np.float32], copy: bool = False) -> torch.Tensor:
         """
