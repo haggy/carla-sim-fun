@@ -21,7 +21,7 @@ def train(data_folder, save_path):
     optimizer = torch.optim.Adam(infer_action.parameters(), lr=1e-2)
 
     nr_epochs = 100
-    batch_size = 64
+    batch_size = 256
     nr_of_classes = NR_OF_CLASSES
     start_time = time.time()
 
