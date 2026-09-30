@@ -155,9 +155,12 @@ class ClassificationNetwork(torch.nn.Module):
         elif steer < 0.0:
             self._cs = max(self._cs - steer_coeff, -0.7)
         else:
-            # Steer is back to 0 so converge to that
-            delta = steer_coeff * (-1 if self._cs > 0.0 else 1)
-            self._cs =  max(self._cs + delta, 0.0)
+            # Steer is back to 0 so converge to that from either side,
+            # clamping at 0 so a small residual cannot overshoot
+            if self._cs > 0.0:
+                self._cs = max(self._cs - steer_coeff, 0.0)
+            else:
+                self._cs = min(self._cs + steer_coeff, 0.0)
 
         return float(self._cs), float(self._ct), float(brake)
 
