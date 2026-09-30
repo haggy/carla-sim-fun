@@ -57,6 +57,7 @@ Use ARROWS or WASD keys for control.
 
 from __future__ import print_function
 from dataclasses import dataclass
+import glob
 from pathlib import Path
 from typing import Any, Tuple
 
@@ -1351,7 +1352,7 @@ class DataCollectionFrame:
     
 class DataCollection:
 
-    def __init__(self, data_save_dir: Path | None = None, brain: ClassificationNetwork | None = None):
+    def __init__(self, data_save_dir: Path | None = None, brain: ClassificationNetwork | None = None, clear_existing_data: bool = False):
         """
         :param: data_save_dir The base directory to persist collected datasets. Defaults to CWD
         :param: brain The network to use for inferring actions based on sensor data. None if user controlled
@@ -1368,6 +1369,8 @@ class DataCollection:
         
         # Stores the inferred control from the model when in inference mode
         self._next_control: "carla.VehicleControl | None" = None
+
+        self._clear_existing_data = clear_existing_data
         
 
     def shutdown(self) -> None:
@@ -1446,6 +1449,20 @@ class DataCollection:
     def get_next_inferred_control(self) -> "carla.VehicleControl | None":
         return self._next_control
 
+    def _get_max_file_index(self, glob_pattern: str = "captured_data_*_img.npy") -> int:
+        """
+        Returns the highest file index for the data capture files in the persistence path
+        NOTE: This assumes the index is at the 2nd to last position in the file name (delimiter="_")
+        """
+        data_files: list[str] = glob.glob(f"module/{glob_pattern}")
+        
+        if not data_files:
+            return 0
+        
+        return max(
+            [int(p.split("_")[-2]) for p in data_files]
+        )
+
     def _process_data_frames(self) -> None:
         """
         Writes each batch as a PAIR of numpy files, because an ndarray is
@@ -1470,7 +1487,7 @@ class DataCollection:
         meta_cache: list[npt.NDArray[np.float32]] = []
         error_count = 0
         frame_num = 0
-        batch_num = 0
+        batch_num = self._get_max_file_index()
         batch_size = 20000  # Number of frames to process per batch
 
         for i in range(0, total_frames, batch_size):

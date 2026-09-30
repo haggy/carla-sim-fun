@@ -112,10 +112,12 @@ class CarlaDataset(Dataset):
         return np.load(p, mmap_mode="r")
 
 
-def get_dataloader(data_dir: str, batch_size: int = 64, num_workers: int = 4, shuffle: bool = True):
+def get_dataloader(data_dir: str, batch_size: int = 256, num_workers: int = 4, shuffle: bool = True):
     return torch.utils.data.DataLoader(
                 CarlaDataset(data_dir=data_dir),
                 batch_size=batch_size,
                 num_workers=num_workers,
-                shuffle=shuffle
+                shuffle=shuffle,
+                pin_memory=True,
+                persistent_workers=True,
             )
