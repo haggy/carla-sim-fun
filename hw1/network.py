@@ -19,21 +19,44 @@ IMG_HEIGHT = 240
 
 # Images are stored on disk as uint8 (0-255) and scaled to [0,1] here. Every
 # consumer - training, the pygame inference loop and the benchmark agent - MUST
-# go through image_to_tensor so the model never sees a different input range
-# than it was trained on.
+# go through normalize_images (directly or via image_to_tensor) so the model
+# never sees a different input range than it was trained on.
 PIXEL_SCALE = 255.0
 
 
-def image_to_tensor(img_hwc) -> torch.Tensor:
+def image_to_raw_tensor(img_hwc) -> torch.Tensor:
     """
-    Convert one RGB observation into the tensor layout the network expects.
+    Reorder one RGB observation into the network's (C, H, W) layout WITHOUT
+    scaling it, keeping its dtype (normally uint8). Moving uint8 to the GPU
+    and scaling there copies 4x fewer bytes than sending float32.
 
     img_hwc: (H, W, 3) numpy array, uint8 0-255 or float carrying 0-255 values
+    return   (3, H, W) tensor, same dtype and value range as the input
+    """
+    return torch.from_numpy(np.ascontiguousarray(img_hwc)).permute(2, 0, 1)
+
+
+def normalize_images(raw: torch.Tensor) -> torch.Tensor:
+    """
+    Scale raw 0-255 pixel tensors to float32 [0, 1] on whatever device they
+    already live on. Call this AFTER moving the tensor to the GPU.
+
+    raw:     (..., 3, H, W) tensor holding 0-255 values
+    return   same shape, float32 scaled to [0, 1]
+    """
+    return raw.float() / PIXEL_SCALE
+
+
+def image_to_tensor(img_hwc, device: torch.device | None = None) -> torch.Tensor:
+    """
+    Convert one RGB observation into the tensor the network expects. The raw
+    pixels are moved to `device` first and scaled there.
+
+    img_hwc: (H, W, 3) numpy array, uint8 0-255 or float carrying 0-255 values
+    device:  where the result should live; None keeps it on the CPU
     return   (3, H, W) float32 tensor scaled to [0, 1]
     """
-    arr = np.ascontiguousarray(img_hwc)
-    tensor = torch.from_numpy(arr.astype(np.float32, copy=False) / PIXEL_SCALE)
-    return tensor.permute(2, 0, 1)
+    return normalize_images(image_to_raw_tensor(img_hwc).to(device))
 
 # Action-classes (HW1 s1.2b). Each class decodes to one (steer, throttle, brake)
 # triple, matching carla.VehicleControl: steer is a single signed value where
@@ -183,7 +206,7 @@ class ClassificationNetwork(torch.nn.Module):
         img_in: (H, W, 3) uint8 or float array holding 0-255 pixel values
         return  float32 (3, H, W) tensor scaled to [0, 1], on this model's device
         """
-        return image_to_tensor(img_in).to(self.get_device())
+        return image_to_tensor(img_in, self.get_device())
 
     def get_device(self) -> torch.device:
         return _get_avail_device()

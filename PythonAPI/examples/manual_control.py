@@ -1358,11 +1358,11 @@ class DataCollection:
         :param: brain The network to use for inferring actions based on sensor data. None if user controlled
         """
         # 2D array to capture raw data
-        # Additional data samples will be concatenated column-wise
+        # Additional data samples will be concatenated row-wise (one frame per row)
         self._vectorized_dataset: npt.NDArray[np.uint8] | None = None
         self._curr_frame: DataCollectionFrame = DataCollectionFrame()
         self._frames: list[DataCollectionFrame] = []
-        self._persistance_dir = data_save_dir or Path.cwd()
+        self._persistance_dir = data_save_dir or Path.cwd() + "/data/"
 
         self._brain = brain
         self._infer_mode = brain is not None
@@ -1454,7 +1454,7 @@ class DataCollection:
         Returns the highest file index for the data capture files in the persistence path
         NOTE: This assumes the index is at the 2nd to last position in the file name (delimiter="_")
         """
-        data_files: list[str] = glob.glob(f"module/{glob_pattern}")
+        data_files: list[str] = glob.glob(str(self._persistance_dir / glob_pattern))
         
         if not data_files:
             return 0
@@ -1469,17 +1469,20 @@ class DataCollection:
         homogeneous and the pixels and the float observations need different
         dtypes:
 
-            captured_data_<n>_img.npy   uint8   (H*W*3, frames)
+            captured_data_<n>_img.npy   uint8   (frames, H*W*3)
                 the flattened RGB image, alpha dropped
 
-            captured_data_<n>_meta.npy  float32 (7, frames)
-                row 0   speed
-                rows1-3 acceleration (x, y, z)
-                rows4-6 steer (signed: negative left, positive right), throttle, brake
+            captured_data_<n>_meta.npy  float32 (frames, 7)
+                col 0   speed
+                cols1-3 acceleration (x, y, z)
+                cols4-6 steer (signed: negative left, positive right), throttle, brake
+
+        Both are frame-major (one frame per ROW) so the training loader reads
+        each sample as one contiguous block - see CarlaDataset.
 
         Storing the pixels as uint8 rather than promoting them to float32 makes
         the dataset 4x smaller and lossless - the values are integral 0-255.
-        The last 3 meta rows are the desired control state (the actions for the
+        The last 3 meta columns are the desired control state (the actions for the
         observations).
         """
         total_frames = len(self._frames)
@@ -1503,11 +1506,11 @@ class DataCollection:
                     next_flat_img_data = next_flat_img_data[:, :, ::-1]  # Reverses the channels BGR -> RGB
                     # Keep the pixels as uint8; promoting them to float32 here is
                     # what previously quadrupled the dataset for no added precision.
-                    next_flat_img_data = next_flat_img_data.reshape((-1, 1)).astype(np.uint8)
+                    next_flat_img_data = next_flat_img_data.reshape((1, -1)).astype(np.uint8)
 
                     # speed and acceleration vector
                     movement_dynamics = np.fromiter([frame.speed, frame.accel_x, frame.accel_y, frame.accel_z], dtype=np.float32)
-                    movement_dynamics = movement_dynamics.reshape((-1, 1))
+                    movement_dynamics = movement_dynamics.reshape((1, -1))
 
                     # The expert's raw control triple, in carla.VehicleControl order.
                     # Discretising into action-classes happens at training time via
@@ -1524,11 +1527,11 @@ class DataCollection:
                         controls[1] = 0.0
                         controls[2] = 1.0
 
-                    controls = controls.reshape((-1, 1))
+                    controls = controls.reshape((1, -1))
 
-                    # Two columns, one per dtype, kept in lockstep by index.
+                    # Two rows, one per dtype, kept in lockstep by index.
                     img_cache.append(next_flat_img_data)
-                    meta_cache.append(np.concat([movement_dynamics, controls]))
+                    meta_cache.append(np.concat([movement_dynamics, controls], axis=1))
                     frame_num += 1
                 except ValueError as ve:
                     print(f"Encountered value error: {ve}")
@@ -1541,8 +1544,8 @@ class DataCollection:
                 f"{error_count} errors ({round(error_count / total_frames * 100)}%)")
 
             print("Creating vectorized dataset")
-            img_dataset = np.concat(img_cache, axis=1)
-            meta_dataset = np.concat(meta_cache, axis=1)
+            img_dataset = np.concat(img_cache, axis=0)
+            meta_dataset = np.concat(meta_cache, axis=0)
             print(f"Vectorized dataset created. images {img_dataset.shape} ({img_dataset.dtype}), "
                   f"meta {meta_dataset.shape} ({meta_dataset.dtype})")
 
@@ -1620,9 +1623,12 @@ def game_loop(args):
         if args.model_path is not None:
             model = ClassificationNetwork.load_and_eval(Path(args.model_path))
             
-        # Save to the base modules dir
+        # Save frame-major captures to module/data, apart from the old
+        # column-major captures still sitting in module/
+        data_save_dir = Path(__file__).resolve().parent.parent.parent / "data"
+        data_save_dir.mkdir(exist_ok=True)
         data_collection = DataCollection(
-            data_save_dir=Path(__file__).resolve().parent.parent.parent,
+            data_save_dir=data_save_dir,
             brain=model,
         )
 

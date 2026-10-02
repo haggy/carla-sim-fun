@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from module.hw1.network import ClassificationNetwork, NR_OF_CLASSES
+from module.hw1.network import ClassificationNetwork, NR_OF_CLASSES, normalize_images
 from module.hw1.dataset import get_dataloader
 
 
@@ -37,7 +37,10 @@ def train(data_folder, save_path):
         nr_batches = 0
 
         for batch_idx, batch in enumerate(train_loader):
-            batch_in, batch_gt = batch[0].to(gpu), batch[1].to(gpu)
+            # The loader yields uint8 images; scale them on the GPU so the
+            # pinned host->device copy moves 4x fewer bytes than float32.
+            batch_in = normalize_images(batch[0].to(gpu, non_blocking=True))
+            batch_gt = batch[1].to(gpu, non_blocking=True)
 
             batch_out = infer_action(batch_in)
             # batch_gt holds the expert's raw (steer, throttle, brake) triple;

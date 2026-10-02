@@ -8,7 +8,7 @@ import numpy.typing as npt
 import torch
 from torch.utils.data import Dataset
 
-from module.hw1.network import IMG_HEIGHT, IMG_WIDTH, image_to_tensor
+from module.hw1.network import IMG_HEIGHT, IMG_WIDTH, image_to_raw_tensor
 
 # Meta rows per sample: 4 movement dynamics + 3 controls (steer, throttle, brake)
 NR_DYNAMICS_ROWS = 4
@@ -27,8 +27,13 @@ class CarlaDataset(Dataset):
 
     Each capture is two files, because an ndarray is homogeneous and the pixels
     and the float observations need different dtypes:
-        <base>_img.npy   uint8   (IMG_ROWS, frames)
-        <base>_meta.npy  float32 (NR_META_ROWS, frames)
+        <base>_img.npy   uint8   (frames, IMG_ROWS)
+        <base>_meta.npy  float32 (frames, NR_META_ROWS)
+
+    Both are frame-major - one frame per ROW - so a sample is one contiguous
+    read. The older column-major (rows, frames) layout spread each image's
+    pixels `frames` bytes apart, which made loading ~300x slower; convert old
+    captures with transpose_data.py.
 
     Files are memory-mapped and indexed in place rather than concatenated, so
     startup is instant and memory stays low regardless of dataset size.
@@ -52,27 +57,29 @@ class CarlaDataset(Dataset):
             images = self._load_npy(img_path)
             meta = self._load_npy(meta_path)
 
-            if images.shape[0] != IMG_ROWS:
+            if images.shape[1] != IMG_ROWS:
+                hint = (" - this looks like the old column-major layout, convert it "
+                        "with transpose_data.py" if images.shape[0] == IMG_ROWS
+                        else f" ({IMG_HEIGHT}x{IMG_WIDTH}x3) - wrong capture resolution?")
                 raise Exception(
-                    f"[{img_path}] has {images.shape[0]} image rows, expected {IMG_ROWS} "
-                    f"({IMG_HEIGHT}x{IMG_WIDTH}x3) - wrong capture resolution?"
+                    f"[{img_path}] has shape {images.shape}, expected (frames, {IMG_ROWS}){hint}"
                 )
-            if meta.shape[0] != NR_META_ROWS:
+            if meta.shape[1] != NR_META_ROWS:
                 raise Exception(
-                    f"[{meta_path}] has {meta.shape[0]} meta rows, expected {NR_META_ROWS}"
+                    f"[{meta_path}] has shape {meta.shape}, expected (frames, {NR_META_ROWS})"
                 )
-            if images.shape[1] != meta.shape[1]:
+            if images.shape[0] != meta.shape[0]:
                 raise Exception(
-                    f"[{img_path}] holds {images.shape[1]} frames but its meta file "
-                    f"holds {meta.shape[1]} - the pair is out of sync"
+                    f"[{img_path}] holds {images.shape[0]} frames but its meta file "
+                    f"holds {meta.shape[0]} - the pair is out of sync"
                 )
 
             self._images.append(images)
             self._meta.append(meta)
 
-        # Prefix sums let __getitem__ map a global index onto (file, column)
+        # Prefix sums let __getitem__ map a global index onto (file, row)
         # without ever concatenating the files together.
-        counts = [img.shape[1] for img in self._images]
+        counts = [img.shape[0] for img in self._images]
         self._offsets = np.cumsum([0] + counts)
 
         print(
@@ -89,18 +96,20 @@ class CarlaDataset(Dataset):
         idx:      int, index of the data
 
         return    (image, action), both in torch.Tensor format
-                  image  float32 (3, H, W) scaled to [0, 1]
+                  image  uint8 (3, H, W), still 0-255 - the training loop
+                         scales it with normalize_images once it is on the GPU
                   action float32 (3,) - steer, throttle, brake
         """
         file_idx = int(np.searchsorted(self._offsets, idx, side="right")) - 1
-        col = int(idx - self._offsets[file_idx])
+        row = int(idx - self._offsets[file_idx])
 
-        # np.asarray materialises just this column out of the memory map.
-        img = np.asarray(self._images[file_idx][:, col]).reshape(IMG_HEIGHT, IMG_WIDTH, 3)
-        observation = image_to_tensor(img)
+        # np.array copies just this frame - one contiguous block - out of the
+        # read-only memory map.
+        img = np.array(self._images[file_idx][row]).reshape(IMG_HEIGHT, IMG_WIDTH, 3)
+        observation = image_to_raw_tensor(img)
 
-        meta = np.asarray(self._meta[file_idx][:, col])
-        action = torch.from_numpy(meta[-NR_ACTION_ROWS:].copy())
+        meta = np.array(self._meta[file_idx][row])
+        action = torch.from_numpy(meta[-NR_ACTION_ROWS:])
 
         return observation, action
 
@@ -112,7 +121,7 @@ class CarlaDataset(Dataset):
         return np.load(p, mmap_mode="r")
 
 
-def get_dataloader(data_dir: str, batch_size: int = 256, num_workers: int = 4, shuffle: bool = True):
+def get_dataloader(data_dir: str, batch_size: int = 256, num_workers: int = 12, shuffle: bool = True):
     return torch.utils.data.DataLoader(
                 CarlaDataset(data_dir=data_dir),
                 batch_size=batch_size,
