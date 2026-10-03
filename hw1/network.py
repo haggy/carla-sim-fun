@@ -18,9 +18,14 @@ def conv_out(size, kernel_size, stride):
     return (size - kernel_size) // stride + 1
 
 def _get_avail_device() -> torch.device:
-    # torch.accelerator only exists from torch 2.6; older installs fall back to CUDA/CPU
-    if hasattr(torch, "accelerator"):
-        return torch.accelerator.current_accelerator() or torch.device("cpu")
+    # torch.accelerator only exists from torch 2.6; older installs fall back to CUDA/CPU.
+    # current_accelerator() reports the accelerator torch was BUILT for, even when
+    # none is usable (no GPU, CUDA_VISIBLE_DEVICES=""), so check availability first.
+    accelerator = getattr(torch, "accelerator", None)
+    if accelerator is not None and hasattr(accelerator, "is_available"):
+        if accelerator.is_available():
+            return accelerator.current_accelerator()
+        return torch.device("cpu")
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Observation size mandated by the homework (HW1 s1.5): 320 wide by 240 high.
