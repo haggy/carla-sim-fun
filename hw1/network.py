@@ -1,17 +1,27 @@
+# Postpones evaluation of every annotation (tuple[...], X | None, ...) so this
+# file still imports on the Python 3.7 used by the CARLA 0.9.10 benchmark.
+from __future__ import annotations
+
 from pathlib import Path
-from typing import Tuple
+from typing import TYPE_CHECKING, Tuple
 
 import torch
 import torch.nn as nn
 import torch.functional as F
 import numpy as np
-import numpy.typing as npt
+
+if TYPE_CHECKING:
+    # Annotation-only; numpy.typing does not exist before numpy 1.20
+    import numpy.typing as npt
 
 def conv_out(size, kernel_size, stride):
     return (size - kernel_size) // stride + 1
 
 def _get_avail_device() -> torch.device:
-    return torch.accelerator.current_accelerator() or torch.device("cpu")
+    # torch.accelerator only exists from torch 2.6; older installs fall back to CUDA/CPU
+    if hasattr(torch, "accelerator"):
+        return torch.accelerator.current_accelerator() or torch.device("cpu")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Observation size mandated by the homework (HW1 s1.5): 320 wide by 240 high.
 # Arrays are therefore (H, W, C) = (240, 320, 3).
@@ -171,7 +181,10 @@ class ClassificationNetwork(torch.nn.Module):
         idx = int(scores.reshape(-1, NR_OF_CLASSES).argmax(dim=-1)[0])
         steer, throttle, brake = ACTION_CLASSES[idx]
 
-        return float(steer), float(throttle), float(brake)
+        if self._smooth_control:
+            return self._smooth_controls(steer, throttle, brake)
+        else:
+            return float(steer), float(throttle), float(brake)
 
     def _smooth_controls(self, steer: float, throttle: float, brake: float) -> Tuple[float, float, float]:
         """
@@ -200,10 +213,7 @@ class ClassificationNetwork(torch.nn.Module):
             else:
                 self._cs = min(self._cs + 0.1, 0.0)
 
-        if self._smooth_control:
-            return self._smooth_controls(steer, throttle, brake)
-        else:
-            return float(self._cs), float(self._ct), float(brake)
+        return float(self._cs), float(self._ct), float(brake)
 
     def reset_smoothing(self, force: bool = True) -> None:
         """
@@ -218,8 +228,8 @@ class ClassificationNetwork(torch.nn.Module):
             self._ct = 0.0
         if force or not hasattr(self, "_cs"):
             self._cs = 0.0
-        if force or not hasattr(self, "_smooth_controls"):
-            self._smooth_controls = False
+        if force or not hasattr(self, "_smooth_control"):
+            self._smooth_control = False
 
     def numpy_img_to_tensor(self, img_in: npt.NDArray[np.float32], copy: bool = False) -> torch.Tensor:
         """
@@ -234,6 +244,27 @@ class ClassificationNetwork(torch.nn.Module):
     @staticmethod
     def load_and_eval(model_path: Path) -> "ClassificationNetwork":
         model = torch.load(model_path, weights_only=False, map_location=_get_avail_device())
+        model.eval()
+        return model
+
+    def export_weights(self, weights_path: Path) -> None:
+        """
+        Save only the state_dict, in torch's legacy (pre-1.6) format so any
+        torch >= 1.0 can read it. Unlike the pickled model written by
+        training.py, it does not depend on this module's import path.
+        """
+        torch.save(self.state_dict(), str(weights_path), _use_new_zipfile_serialization=False)
+
+    @staticmethod
+    def load_weights(weights_path: Path, **kwargs) -> "ClassificationNetwork":
+        """
+        Build a fresh network (kwargs go to __init__) and load a state_dict
+        written by export_weights, ready for inference on the available device.
+        """
+        device = _get_avail_device()
+        model = ClassificationNetwork(**kwargs)
+        model.load_state_dict(torch.load(str(weights_path), map_location=device))
+        model.to(device)
         model.eval()
         return model
 
