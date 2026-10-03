@@ -46,7 +46,9 @@ def train(data_folder, save_path):
             # batch_gt holds the expert's raw (steer, throttle, brake) triple;
             # discretise it into one-hot action-classes for the loss.
             batch_gt = infer_action.actions_to_classes(batch_gt)
-            loss = cross_entropy_loss(batch_out, batch_gt)
+
+            class_weights = torch.tensor([0.90,  0.32, 2.57, 2.80, 6.39, 4.12, 0.60]).to(gpu)
+            loss = cross_entropy_loss(batch_out, batch_gt, class_weights)
 
             optimizer.zero_grad()
             loss.backward()
@@ -142,7 +144,7 @@ def plot_loss(epoch_losses, model_path):
     return plot_path
 
 
-def cross_entropy_loss(batch_out, batch_gt):
+def cross_entropy_loss(batch_out, batch_gt, class_weights=None):
     """
     Calculates the cross entropy loss between the prediction of the network and
     the ground truth class for one batch.
@@ -152,7 +154,7 @@ def cross_entropy_loss(batch_out, batch_gt):
     return          float
     """
     # TODO: Need to implement my own CE loss function
-    return nn.functional.cross_entropy(batch_out, batch_gt)
+    return nn.functional.cross_entropy(batch_out, batch_gt, class_weights)
 
 
 if __name__ == "__main__":

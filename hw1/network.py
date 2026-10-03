@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -86,10 +87,12 @@ BRAKE_THRESHOLD = 0.5
 
 
 class ClassificationNetwork(torch.nn.Module):
-    def __init__(self, img_height: int = IMG_HEIGHT, img_width: int = IMG_WIDTH):
+    def __init__(self, img_height: int = IMG_HEIGHT, img_width: int = IMG_WIDTH, smooth_control: bool = False):
         """
         Implementation of the network layers. The image size of the input
         observations is 320x240 pixels (width x height).
+
+        :param: smooth_control if True, control output is smoothed over a continuous curve instead of raw network outputs
         """
         super().__init__()
 
@@ -105,11 +108,12 @@ class ClassificationNetwork(torch.nn.Module):
             nn.BatchNorm2d(num_features=32),
             nn.ReLU(),
             nn.Flatten(),
+            nn.Dropout(p=0.5),
             nn.Linear(32 * h * w, NR_OF_CLASSES),
         )
 
         self._softmax = nn.Softmax(dim=1)
-
+        self._smooth_control = smooth_control
         self._ct = 0.0
         self._cs = 0.0
 
@@ -167,12 +171,23 @@ class ClassificationNetwork(torch.nn.Module):
         idx = int(scores.reshape(-1, NR_OF_CLASSES).argmax(dim=-1)[0])
         steer, throttle, brake = ACTION_CLASSES[idx]
 
+        return float(steer), float(throttle), float(brake)
+
+    def _smooth_controls(self, steer: float, throttle: float, brake: float) -> Tuple[float, float, float]:
+        """
+        Experimental! We try to smooth the very extreme values from the network output to prevent the car
+        from thrashing all over the road. This has been shown to help in some cases, hurt in others
+        """
         if throttle > 0.0:
-            self._ct = min(self._ct + 1e-1, 1.0)
+            throttle_coeff = 0.1
+            if self._ct > 0.6:
+                throttle_coeff = 1e-3
+            
+            self._ct = min(self._ct + throttle_coeff, 1.0)
         else:
             self._ct = 0.0
 
-        steer_coeff = 0.1
+        steer_coeff = 0.01
         if steer > 0.0:
             self._cs = min(self._cs + steer_coeff, 0.7)
         elif steer < 0.0:
@@ -181,11 +196,14 @@ class ClassificationNetwork(torch.nn.Module):
             # Steer is back to 0 so converge to that from either side,
             # clamping at 0 so a small residual cannot overshoot
             if self._cs > 0.0:
-                self._cs = max(self._cs - steer_coeff, 0.0)
+                self._cs = max(self._cs - 0.1, 0.0)
             else:
-                self._cs = min(self._cs + steer_coeff, 0.0)
+                self._cs = min(self._cs + 0.1, 0.0)
 
-        return float(self._cs), float(self._ct), float(brake)
+        if self._smooth_control:
+            return self._smooth_controls(steer, throttle, brake)
+        else:
+            return float(self._cs), float(self._ct), float(brake)
 
     def reset_smoothing(self, force: bool = True) -> None:
         """
@@ -200,6 +218,8 @@ class ClassificationNetwork(torch.nn.Module):
             self._ct = 0.0
         if force or not hasattr(self, "_cs"):
             self._cs = 0.0
+        if force or not hasattr(self, "_smooth_controls"):
+            self._smooth_controls = False
 
     def numpy_img_to_tensor(self, img_in: npt.NDArray[np.float32], copy: bool = False) -> torch.Tensor:
         """

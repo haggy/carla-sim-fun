@@ -84,6 +84,7 @@ import weakref
 # Custom imports / declarations
 from module import util
 from pprint import pprint
+import torch
 
 from module.hw1.network import ClassificationNetwork, IMG_HEIGHT, IMG_WIDTH
 
@@ -1352,10 +1353,16 @@ class DataCollectionFrame:
     
 class DataCollection:
 
-    def __init__(self, data_save_dir: Path | None = None, brain: ClassificationNetwork | None = None, clear_existing_data: bool = False):
+    def __init__(self, 
+            data_save_dir: Path | None = None, 
+            brain: ClassificationNetwork | None = None, 
+            clear_existing_data: bool = False,
+            dagger: bool = False,
+        ):
         """
         :param: data_save_dir The base directory to persist collected datasets. Defaults to CWD
         :param: brain The network to use for inferring actions based on sensor data. None if user controlled
+        :param: dagger True if we are using the DAgger algorithm
         """
         # 2D array to capture raw data
         # Additional data samples will be concatenated row-wise (one frame per row)
@@ -1371,10 +1378,11 @@ class DataCollection:
         self._next_control: "carla.VehicleControl | None" = None
 
         self._clear_existing_data = clear_existing_data
+        self._dagger = dagger
         
 
     def shutdown(self) -> None:
-        if self._infer_mode:
+        if self._infer_mode and not self._dagger:
             print("In inference-only mode. No data to process")
             return
         
@@ -1387,45 +1395,51 @@ class DataCollection:
             # Wait until we have the image data
             return
 
-        if self._infer_mode:
-            frame = self._curr_frame
-            # TODO: DRY this up (duplicated in process fn)
-            next_flat_img_data = np.frombuffer(frame.rgb_raw_image_data, dtype=np.uint8)
-            next_flat_img_data = next_flat_img_data.reshape((frame.rgb_img_h, frame.rgb_img_w, 4))
-            next_flat_img_data = next_flat_img_data[:, :, :3]  # Drop the 4th (alpha) channel
-            next_flat_img_data = next_flat_img_data[:, :, ::-1]  # Reverses the channels BGR -> RGB
+        try:
+            if self._infer_mode:
+                frame = self._curr_frame
+                # TODO: DRY this up (duplicated in process fn)
+                next_flat_img_data = np.frombuffer(frame.rgb_raw_image_data, dtype=np.uint8)
+                next_flat_img_data = next_flat_img_data.reshape((frame.rgb_img_h, frame.rgb_img_w, 4))
+                next_flat_img_data = next_flat_img_data[:, :, :3]  # Drop the 4th (alpha) channel
+                next_flat_img_data = next_flat_img_data[:, :, ::-1]  # Reverses the channels BGR -> RGB
 
-            # unsqueeze necessary to add to a "batch" of 1 for forward pass
-            # numpy_img_to_tensor applies the SAME /255 scaling training uses.
-            img_tensor = self._brain.numpy_img_to_tensor(next_flat_img_data).unsqueeze(0)
-            scores = self._brain(img_tensor)
-            steer, throttle, brake = self._brain.scores_to_action(scores)
+                # unsqueeze necessary to add to a "batch" of 1 for forward pass
+                # numpy_img_to_tensor applies the SAME /255 scaling training uses.
+                img_tensor = self._brain.numpy_img_to_tensor(next_flat_img_data).unsqueeze(0)
+                scores = self._brain(img_tensor)
+                steer, throttle, brake = self._brain.scores_to_action(scores)
 
-            self._next_control = carla.VehicleControl(
-                steer=steer, throttle=throttle, brake=brake)
+                self._next_control = carla.VehicleControl(
+                    steer=steer, throttle=throttle, brake=brake)
+                if DEBUG:
+                    print(f"inferred: steer={steer:+.2f} throttle={throttle:.2f} brake={brake:.2f}")
+
+                if not self._dagger:
+                    # We are not collecting expert data during the inference run
+                    return
+
+            # Read the control the vehicle actually ran with this frame. get_control()
+            # reports the last control applied to the actor whatever applied it, so
+            # this covers every driver: keyboard expert, the model, AND the autopilot
+            # (--autopilot / P). KeyboardControl.parse_events cannot cover autopilot
+            # because its whole control block sits inside `if not autopilot_enabled`.
+            self.set_control(world.player.get_control())
+
+            vel = world.player.get_velocity()
+            self.set_speed(3.6 * math.sqrt(vel.x**2 + vel.y**2 + vel.z**2))
+
+            self.set_acceleration(*world.imu_sensor.accelerometer)
+            
+            self._frames.append(self._curr_frame)
+
             if DEBUG:
-                print(f"inferred: steer={steer:+.2f} throttle={throttle:.2f} brake={brake:.2f}")
-            return
+                print(f"Collected {len(self._frames)} frames")
+                pprint(self._curr_frame)
 
-        # Read the control the vehicle actually ran with this frame. get_control()
-        # reports the last control applied to the actor whatever applied it, so
-        # this covers every driver: keyboard expert, the model, AND the autopilot
-        # (--autopilot / P). KeyboardControl.parse_events cannot cover autopilot
-        # because its whole control block sits inside `if not autopilot_enabled`.
-        self.set_control(world.player.get_control())
-
-        vel = world.player.get_velocity()
-        self.set_speed(3.6 * math.sqrt(vel.x**2 + vel.y**2 + vel.z**2))
-
-        self.set_acceleration(*world.imu_sensor.accelerometer)
-        
-        self._frames.append(self._curr_frame)
-
-        if DEBUG:
-            print(f"Collected {len(self._frames)} frames")
-            pprint(self._curr_frame)
-
-        self._curr_frame = DataCollectionFrame()
+            self._curr_frame = DataCollectionFrame()
+        except ValueError as ve:
+            print(f"DataCollection: Error processing tick: {ve}")
 
     def handle_rgb_sensor_data(self, img: carla.Image) -> None:
         self._curr_frame.rgb_img_h = img.height
@@ -1622,6 +1636,7 @@ def game_loop(args):
 
         if args.model_path is not None:
             model = ClassificationNetwork.load_and_eval(Path(args.model_path))
+            model.eval()
             
         # Save frame-major captures to module/data, apart from the old
         # column-major captures still sitting in module/
@@ -1630,6 +1645,7 @@ def game_loop(args):
         data_collection = DataCollection(
             data_save_dir=data_save_dir,
             brain=model,
+            dagger=args.dagger,
         )
 
         def hood_transform(player):
@@ -1662,21 +1678,22 @@ def game_loop(args):
         attach_preview_camera(world.player)
         preview_player_id = world.player.id
 
-        while True:
-            if args.sync:
-                sim_world.tick()
-            clock.tick_busy_loop(60)
-            if controller.parse_events(client, world, clock, args.sync, data_collection):
-                return
-            # world.restart() replaces the player, taking attached sensors with it.
-            if world.player.id != preview_player_id:
-                preview_player_id = world.player.id
-                attach_preview_camera(world.player)
+        with torch.no_grad():
+            while True:
+                if args.sync:
+                    sim_world.tick()
+                clock.tick_busy_loop(60)
+                if controller.parse_events(client, world, clock, args.sync, data_collection):
+                    return
+                # world.restart() replaces the player, taking attached sensors with it.
+                if world.player.id != preview_player_id:
+                    preview_player_id = world.player.id
+                    attach_preview_camera(world.player)
 
-            data_collection.tick(world)
-            world.tick(clock)
-            world.render(display)
-            pygame.display.flip()
+                data_collection.tick(world)
+                world.tick(clock)
+                world.render(display)
+                pygame.display.flip()
 
     finally:
         if sensor_manager is not None:
@@ -1757,6 +1774,10 @@ def main():
     argparser.add_argument(
             '--model_path',
             help='Use trained inference model given at <path> to drive the vehicle')
+    argparser.add_argument(
+            '--dagger',
+            action='store_true',
+            help='Use the DAgger algorithm to collect expert training data while model inference is in control')
     args = argparser.parse_args()
 
     args.width, args.height = [int(x) for x in args.res.split('x')]
