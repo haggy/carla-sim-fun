@@ -1,6 +1,7 @@
 import glob
 import os
 from pathlib import Path
+from typing import Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -39,7 +40,11 @@ class CarlaDataset(Dataset):
     startup is instant and memory stays low regardless of dataset size.
     """
 
-    def __init__(self, data_dir):
+    def __init__(self, data_dir: str, non_crit_obs_filter: bool = False):
+        """
+        :param: data_dir the root directory that contains the numpy data files
+        :param: non_crit_obs_filter (Experimental) If True, filters some non-critical events like "braking while already stopped"
+        """
         self.data_dir = data_dir
         self.data_list = sorted(glob.glob(os.path.join(data_dir, "*" + IMG_SUFFIX)))
 
@@ -74,6 +79,12 @@ class CarlaDataset(Dataset):
                     f"holds {meta.shape[0]} - the pair is out of sync"
                 )
 
+            if non_crit_obs_filter:
+                print("Filtering non-critical observations")
+                shape_before = (images.shape, meta.shape)
+                images, meta = self._filter_non_critical_obs(images, meta)
+                print(f"Filtering complete. Difference: {shape_before[0]} -> {images.shape}")
+
             self._images.append(images)
             self._meta.append(meta)
 
@@ -86,6 +97,18 @@ class CarlaDataset(Dataset):
             f"Resolved {len(self.data_list)} capture pair(s), {int(self._offsets[-1])} samples, "
             f"memory-mapped ({sum(counts) * IMG_ROWS / 1e9:.2f} GB of images left on disk)"
         )
+
+    def _filter_non_critical_obs(
+            self, 
+            img: npt.NDArray[np.float32], 
+            meta: npt.NDArray[np.float32]
+        ) -> Tuple[npt.NDArray[np.float32], npt.NDArray[np.float32]]:
+        BRAKE_IDX = 6
+        SPEED_IDX = 0
+        # Filter that catches any rows where the brake is applied but the car is already stopped
+        cond = ((meta[:, BRAKE_IDX] > 0.5) & (meta[:, SPEED_IDX] <= 0.1))
+        # Remove all rows matching the filter
+        return img[~cond], meta[~cond]
 
     def __len__(self):
         return int(self._offsets[-1])
