@@ -21,7 +21,6 @@ import importlib
 import os
 import sys
 import gc
-import pkg_resources
 import sys
 import carla
 import copy
@@ -112,7 +111,9 @@ class LeaderboardEvaluator(object):
             # self.traffic_manager = self.client.get_trafficmanager(8000)
         except Exception as e:
             print(e)
-        dist = pkg_resources.get_distribution("carla")
+        # pkg_resources (removed in setuptools >= 81) was only used for this
+        # disabled version check, so the lookup is gone too
+        # dist = pkg_resources.get_distribution("carla")
         # if dist.version != 'leaderboard':
         #     if LooseVersion(dist.version) < LooseVersion('0.9.10'):
         #         raise ImportError("CARLA version 0.9.10.1 or newer required. CARLA version found: {}".format(dist))
@@ -263,7 +264,9 @@ class LeaderboardEvaluator(object):
         else:
             self.world.wait_for_tick()
 
-        if CarlaDataProvider.get_map().name != town:
+        # CARLA >= 0.9.11 reports the full asset path (Carla/Maps/Town01) rather
+        # than the bare town name, so compare only the last path component
+        if CarlaDataProvider.get_map().name.split('/')[-1] != town:
             raise Exception("The CARLA server uses the wrong map!"
                             "This scenario requires to use map {}".format(town))
 
