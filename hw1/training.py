@@ -44,7 +44,7 @@ def train(data_folder, save_path):
     train_loader = make_loader(train_set, batch_size, shuffle=True, num_workers=12)
     val_loader = make_loader(val_set, batch_size, shuffle=False, num_workers=4)
 
-    class_weights = torch.tensor([0.5775928857749183, 0.3522029372496662, 2.703721223588773, 2.0619288119288117, 6.379092261904762, 2.514960398943972, 0.9802206596924484]).to(gpu)
+    class_weights = torch.tensor([0.4664429530201342, 0.3707565470417071, 2.4721099434114793, 2.4542536115569824, 5.299826689774696, 3.0826612903225805, 1.1992156862745098]).to(gpu)
 
     model_path = resolve_model_path(save_path)
     epoch_losses = []

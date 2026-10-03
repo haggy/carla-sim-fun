@@ -107,7 +107,10 @@ class TestAgent(autonomous_agent.AutonomousAgent):
 				return [
 				{
 					'type': 'sensor.camera.rgb',
-					'x': 0.0, 'y': 0.0, 'z':2.0,
+					# Matches manual_control's hood_transform (the training camera) on
+					# the Lincoln MKZ the leaderboard spawns:
+					# x = 0.8*(0.5+extent.x), z = 1.3*(0.5+extent.z)
+					'x': 2.36, 'y': 0.0, 'z': 1.63,
 					'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
 					'width': 320, 'height': 240, 'fov': 90,
 					'id': 'rgb_front'
