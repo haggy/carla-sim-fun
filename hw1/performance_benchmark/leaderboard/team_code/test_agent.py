@@ -26,6 +26,15 @@ from team_code.waypointer import Waypointer
 
 SAVE_PATH = os.environ.get('SAVE_PATH', None)
 
+# Standing-start nudge. The model rarely chooses gas when the car is stopped,
+# because the expert data almost never shows pulling away from a standstill.
+# Until the car has actually moved, full throttle is applied for NUDGE_STEPS
+# after STALL_STEPS consecutive steps below MOVING_SPEED. The leaderboard runs
+# at 20 Hz and the speedometer reports m/s.
+MOVING_SPEED = 0.5   # m/s; at or above this the car counts as having moved
+STALL_STEPS = 120    # 6 s stopped before a nudge
+NUDGE_STEPS = 60     # 3 s of full throttle per nudge
+
 # Weights (state_dict) used when run_evaluation.sh leaves TEAM_CONFIG unset
 DEFAULT_MODEL_PATH = pathlib.Path(__file__).resolve().parent / 'model.pth'
 
@@ -78,6 +87,11 @@ class TestAgent(autonomous_agent.AutonomousAgent):
 		self.takeover = False
 		self.stop_time = 0
 		self.takeover_time = 0
+
+		# Standing-start nudge state
+		self.has_moved = False
+		self.stalled_steps = 0
+		self.nudge_steps_left = 0
 
 
 		self.last_steers = deque()
@@ -203,6 +217,9 @@ class TestAgent(autonomous_agent.AutonomousAgent):
 		
 
 
+		if not self.has_moved:
+			throt, brake = self._standing_start_nudge(tick_data['speed'], throt, brake)
+
 		control = carla.VehicleControl(steer=steer, throttle=throt, brake=brake)
 
 		if SAVE_PATH is not None and self.step % 10 == 0:
@@ -211,6 +228,34 @@ class TestAgent(autonomous_agent.AutonomousAgent):
 
 		return control
 
+
+	def _standing_start_nudge(self, speed, throt, brake):
+		"""
+		Override throttle/brake until the model is driving the car itself.
+		Based on the measured speed rather than the predicted class, because a
+		single gas prediction is not enough to get the car rolling.
+		"""
+		if self.nudge_steps_left > 0:
+			# Always finish a nudge, even once the car is rolling
+			self.nudge_steps_left -= 1
+			return 1.0, 0.0
+
+		if speed >= MOVING_SPEED:
+			# Disarm only once the model itself keeps the car going; if it coasts
+			# back to a stop after a nudge, the nudge stays armed
+			if throt > 0.0:
+				self.has_moved = True
+			self.stalled_steps = 0
+			return throt, brake
+
+		self.stalled_steps += 1
+		if self.stalled_steps >= STALL_STEPS:
+			# Re-arms after each nudge, so a car that stops again before ever
+			# getting going is nudged again
+			self.stalled_steps = 0
+			self.nudge_steps_left = NUDGE_STEPS
+			print('Standing-start nudge at step %d' % self.step)
+		return throt, brake
 
 	def save(self, tick_data):
 		frame = self.step // 10
