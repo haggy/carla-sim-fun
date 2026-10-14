@@ -11,8 +11,8 @@ def homography_ipmnorm2g(top_view_region):
 
 
 # bev
-bev = np.zeros((200, 200, 3))
 H, W = 200, 200
+bev = np.zeros((H, W, 3))
 top_view_region = np.array([[50, -25], [50, 25], [0, -25], [0, 25]])
 
 
