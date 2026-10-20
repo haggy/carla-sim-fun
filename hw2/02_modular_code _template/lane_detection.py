@@ -1,3 +1,4 @@
+import cv2
 import numpy as np
 import numpy.typing as npt
 import matplotlib.pyplot as plt
@@ -19,7 +20,46 @@ class LaneDetection:
 
     '''
 
-    def __init__(self, cut_size=120, spline_smoothness=10, gradient_threshold=14, distance_maxima_gradient=3):
+    def __init__(
+        self,
+        cut_size: int = 120,
+        spline_smoothness: float = 10,
+        gradient_threshold: float = 14,
+        distance_maxima_gradient: int = 3,
+        image_size: tuple[int, int] = (240, 320),
+        camera_fov_deg: float = 90.0,
+        camera_xyz: tuple[float, float, float] = (0.0, 0.0, 2.0),
+        bev_forward_range_m: tuple[float, float] = (3.0, 21.0),
+        bev_lateral_range_m: tuple[float, float] = (-12.0, 12.0),
+    ) -> None:
+        """Configure the lane detector and precompute the front-view to BEV homography.
+
+        Camera defaults mirror the 'rgb_front' sensor in performance_benchmark/leaderboard/team_code/test_agent.py.
+        The default BEV ranges give square 7.5 cm pixels.
+
+        Parameters
+        ----------
+        cut_size : int
+            Number of BEV rows, counted from the car, that are kept for lane detection.
+        spline_smoothness : float
+            Smoothing factor `s` passed to scipy.interpolate.splprep.
+        gradient_threshold : float
+            Absolute gradients below this value are zeroed during edge detection.
+        distance_maxima_gradient : int
+            Minimum pixel distance between neighbouring row-wise gradient maxima.
+        image_size : tuple[int, int]
+            (ImageHeight, ImageWidth) of the front-view camera image, in pixels. The BEV image has the same size.
+        camera_fov_deg : float
+            Horizontal field of view of the camera, in degrees.
+        camera_xyz : tuple[float, float, float]
+            Camera position relative to the vehicle origin, in metres (CARLA frame: x forward, y right, z up).
+            The camera is assumed to have zero roll, pitch and yaw.
+        bev_forward_range_m : tuple[float, float]
+            (near, far) distance ahead of the vehicle covered by the BEV image, in metres. A level camera at
+            2 m with a 90 deg FOV sees no ground closer than ~2.7 m, so a smaller near limit leaves empty rows.
+        bev_lateral_range_m : tuple[float, float]
+            (left, right) lateral extent covered by the BEV image, in metres. Left is negative.
+        """
         self.car_position = np.array([160,0])
         self.spline_smoothness = spline_smoothness
         self.cut_size = cut_size
@@ -27,22 +67,103 @@ class LaneDetection:
         self.distance_maxima_gradient = distance_maxima_gradient
         self.lane_boundary1_old = 0
         self.lane_boundary2_old = 0
-    
+        self.image_size = image_size
+        self.H_bev2im: npt.NDArray[np.float64] = self._bev_to_image_homography(
+            image_size, camera_fov_deg, camera_xyz, bev_forward_range_m, bev_lateral_range_m)
+
+
+    @staticmethod
+    def _bev_to_image_homography(
+        image_size: tuple[int, int],
+        camera_fov_deg: float,
+        camera_xyz: tuple[float, float, float],
+        bev_forward_range_m: tuple[float, float],
+        bev_lateral_range_m: tuple[float, float],
+    ) -> npt.NDArray[np.float64]:
+        """Build the homography that maps homogeneous BEV pixels to homogeneous front-view pixels.
+
+        Every point on a flat ground plane (z=0) satisfies p_im ~ K [r1 r2 t] (x, y, 1)^T, so the
+        3D projection reduces to a plane-to-plane homography. It is composed as
+        BEV pixel -> ground metres -> camera frame -> image pixel.
+
+        Parameters
+        ----------
+        image_size : tuple[int, int]
+            (ImageHeight, ImageWidth) shared by the front-view and BEV images, in pixels.
+        camera_fov_deg : float
+            Horizontal field of view of the camera, in degrees.
+        camera_xyz : tuple[float, float, float]
+            Camera position relative to the vehicle origin, in metres (CARLA frame: x forward, y right, z up).
+        bev_forward_range_m : tuple[float, float]
+            (near, far) distance ahead of the vehicle covered by the BEV image, in metres.
+        bev_lateral_range_m : tuple[float, float]
+            (left, right) lateral extent covered by the BEV image, in metres.
+
+        Returns
+        -------
+        (3 x 3) matrix
+            Homography H_bev2im such that (u_im, v_im, 1) ~ H_bev2im @ (u_bev, v_bev, 1).
+        """
+        height, width = image_size
+        x_near, x_far = bev_forward_range_m
+        y_left, y_right = bev_lateral_range_m
+        cam_x, cam_y, cam_z = camera_xyz
+
+        # CARLA cameras are ideal pinholes: no skew or lens distortion, so K is fully set by the FOV.
+        focal = width / (2.0 * np.tan(np.deg2rad(camera_fov_deg) / 2.0))
+        K = np.array([
+            [focal, 0.0,   width / 2.0],
+            [0.0,   focal, height / 2.0],
+            [0.0,   0.0,   1.0],
+        ])
+
+        # Ground (x, y, 1) -> camera (right, down, forward) for a camera with zero roll/pitch/yaw.
+        # The constant down component is the camera height, because the ground lies at z=0 below it.
+        H_g2cam = np.array([
+            [0.0, 1.0, -cam_y],
+            [0.0, 0.0,  cam_z],
+            [1.0, 0.0, -cam_x],
+        ])
+
+        # BEV pixel centres -> ground metres. The top row is the far edge and the bottom row the near edge,
+        # so the vehicle sits at the bottom centre the way car_position expects.
+        dx = (x_far - x_near) / height
+        dy = (y_right - y_left) / width
+        H_bev2g = np.array([
+            [0.0, -dx, x_far - 0.5 * dx],
+            [dy,  0.0, y_left + 0.5 * dy],
+            [0.0, 0.0, 1.0],
+        ])
+
+        return K @ H_g2cam @ H_bev2g
+
 
     def front2bev(self, front_view_image: npt.NDArray[np.uint8]) -> npt.NDArray[np.uint8]:
-        '''
-        ##### TODO #####
-        This function should transform the front view image to bird-eye-view image.
+        """Warp the front-view image onto the ground plane to get a bird's-eye view, assuming the road is flat.
 
-        input:
-            front_view_image)320x240x3
+        Parameters
+        ----------
+        front_view_image : (ImageHeight x ImageWidth x 3) array
+            Front camera image; the default camera produces (240 x 320 x 3).
 
-        output:
-            bev_image 320x240x3
+        Returns
+        -------
+        (ImageHeight x ImageWidth x 3) array
+            BEV image with the vehicle at the bottom centre and forward pointing up. Ground outside the
+            camera's field of view is black, which makes wedges in the near corners.
+        """
+        height, width = self.image_size
 
-        '''
-        
-        return bev_image 
+        # H_bev2im already maps destination -> source, so pass WARP_INVERSE_MAP to skip a matrix inversion.
+        bev_image: npt.NDArray[np.uint8] = cv2.warpPerspective(
+            front_view_image,
+            self.H_bev2im,
+            (width, height),
+            flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+        return bev_image
 
 
     def cut_gray(self, state_image_full):
@@ -208,7 +329,7 @@ class LaneDetection:
             # if there are more lane_boundary points points than spline parameters 
             # else use perceding spline
             if lane_boundary1_points.shape[0] > 4 and lane_boundary2_points.shape[0] > 4:
-
+                pass
                 # Pay attention: the first lane_boundary point might occur twice
                 # lane_boundary 1
 
