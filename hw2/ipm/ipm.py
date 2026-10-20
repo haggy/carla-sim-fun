@@ -16,7 +16,10 @@ bev = np.zeros((H, W, 3))
 top_view_region = np.array([[50, -25], [50, 25], [0, -25], [0, 25]])
 
 
-# camera parameters
+"""
+Camera params
+- x, y, z: 3D space coords for the camera pinhole
+"""
 cam_xyz = [-1.5, 0, 2.0]
 cam_yaw = 0
 
@@ -24,11 +27,27 @@ width = 480
 height = 270
 fov = 64
 
-# camera intrinsic
+"""
+Cameria Intrinsics
+====
+
+[
+	[f_x, s,   x_0],
+	[0,   f_y, y_0],
+	[0,   0,   1]
+]
+
+CI matrix elements:
+- f_x, f_y: Focal length i.e. distance between the pinhole and the film (image plane)
+	Measured in pixels. Can be non-square for a number of reasons
+- x_0, y_0: Line normal to the image plane face that passes through the pinhole
+	Intersection with the image plane is referred to as the "principal point"
+- s: Axis skew is typically 0 for digital but sometimes nonzero through some digitization processes
+"""
 focal = width / (2.0 * np.tan(fov * np.pi / 360.0)) 
 K = np.identity(3)
-K[0, 0] = K[1, 1] = focal
-K[0, 2] = width / 2.0
+K[0, 0] = K[1, 1] = focal  # Square focal length
+K[0, 2] = width / 2.0  # Line normal is right in the middle of the image
 K[1, 2] = height / 2.0
 
 
@@ -43,7 +62,7 @@ H_g2im = np.matmul(K, temp_mat)
 H_ipmnorm2g = homography_ipmnorm2g(top_view_region)
 H_ipmnorm2im = np.matmul(H_g2im, H_ipmnorm2g)
 
-S_im_inv = np.array([[1/np.float(width), 0, 0], [0, 1/np.float(height), 0], [0, 0, 1]])
+S_im_inv = np.array([[1/np.float32(width), 0, 0], [0, 1/np.float32(height), 0], [0, 0, 1]])
 M_ipm2im_norm = np.matmul(S_im_inv, H_ipmnorm2im)
 
 
@@ -76,6 +95,11 @@ indicate_y2 = y_vals > 0
 indicate = (indicate_x1 * indicate_x2 * indicate_y1 * indicate_y2 * lst)*1
 
 img = cv2.imread('0017.png')
+
+# bgr_img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+cv2.imshow("Source", img)
+cv2.waitKey(0) # Keeps the window open until you press any key
+cv2.destroyAllWindows()
 
 for _i in range(H):
 	for _j in range(W):

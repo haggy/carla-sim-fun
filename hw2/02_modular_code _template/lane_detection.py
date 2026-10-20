@@ -1,4 +1,5 @@
 import numpy as np
+import numpy.typing as npt
 import matplotlib.pyplot as plt
 from scipy.signal import find_peaks
 from scipy.interpolate import splprep, splev
@@ -28,7 +29,7 @@ class LaneDetection:
         self.lane_boundary2_old = 0
     
 
-    def front2bev(self, front_view_image)
+    def front2bev(self, front_view_image: npt.NDArray[np.uint8]) -> npt.NDArray[np.uint8]:
         '''
         ##### TODO #####
         This function should transform the front view image to bird-eye-view image.
