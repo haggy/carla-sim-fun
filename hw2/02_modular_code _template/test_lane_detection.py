@@ -10,6 +10,9 @@ import numpy as np
 import numpy.typing as npt
 
 from lane_detection import LaneDetection
+from object_detection import ObjectDetection
+
+from PIL import Image
 
 # module/util.py lives three levels up; this folder is not a package, so it is put on the path directly.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -65,6 +68,7 @@ def plot_step(
     bev: npt.NDArray[np.uint8],
     gradient_sum: npt.NDArray[np.float64],
     maxima: npt.NDArray[np.int64],
+    objects: npt.NDArray[np.uint8],
     step: int,
 ) -> None:
     """Draw the front view, BEV and thresholded gradients with their row-wise maxima.
@@ -97,6 +101,9 @@ def plot_step(
     axes[2].imshow(gradient_sum, cmap='gray', origin='lower')
     axes[2].scatter(maxima[0], maxima[1], s=1, c='red')
     axes[2].set_title(f'edges + {maxima.shape[1]} maxima')
+
+    axes[3].imshow(objects)
+    axes[3].set_title(f'object detection (step {step})')
 
     plt.gcf().canvas.draw_idle()
     plt.gcf().canvas.flush_events()
@@ -138,8 +145,9 @@ def main() -> None:
         sensors.add_listener(camera_idx, frames.put)
 
         LD_module = LaneDetection()
+        obj_detection = ObjectDetection()
 
-        fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+        fig, axes = plt.subplots(1, 4, figsize=(15, 4.5))
         plt.ion()
         plt.show()
 
@@ -156,9 +164,11 @@ def main() -> None:
             bev = LD_module.front2bev(front)
             gradient_sum = LD_module.edge_detection(LD_module.cut_gray(bev))
             maxima = LD_module.find_maxima_gradient_rowwise(gradient_sum)
+            
+            boxed = obj_detection.run(front)
 
             if step % 2 == 0:
-                plot_step(axes, front, bev, gradient_sum, maxima, step)
+                plot_step(axes, front, bev, gradient_sum, maxima, boxed, step)
             step += 1
 
             if not plt.fignum_exists(fig.number):
@@ -168,6 +178,7 @@ def main() -> None:
             fig.savefig(args.save, dpi=100)
             print(f'saved {args.save}')
     finally:
+        print("Cleaning up...")
         sensors.shutdown()
         if vehicle is not None:
             # The traffic manager crashes the client if it is still driving a vehicle when it is destroyed.
@@ -179,3 +190,13 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+
+    # od = ObjectDetection()
+    # img = np.asarray(Image.open("/home/dave/Downloads/bus.jpg").convert("RGB"))
+    # boxed = od.run(img)
+
+    # fig, axes = plt.subplots(1, 1, figsize=(15, 4.5))
+
+    # axes.imshow(boxed)
+    # plt.show()
+    
