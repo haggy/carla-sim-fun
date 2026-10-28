@@ -71,6 +71,11 @@ class LaneDetection:
         self.H_bev2im: npt.NDArray[np.float64] = self._bev_to_image_homography(
             image_size, camera_fov_deg, camera_xyz, bev_forward_range_m, bev_lateral_range_m)
 
+        # Warping an all-ones image marks which BEV pixels the camera actually sees. The mask is eroded so
+        # pixels next to the black border wedges are also excluded, since their gradients belong to the border.
+        seen: npt.NDArray[np.uint8] = self.front2bev(np.ones((*image_size, 3), dtype=np.uint8))[:, :, 0]
+        self.bev_valid_mask: npt.NDArray[np.bool_] = cv2.erode(seen, np.ones((5, 5), np.uint8)) > 0
+
 
     @staticmethod
     def _bev_to_image_homography(
@@ -166,57 +171,90 @@ class LaneDetection:
         return bev_image
 
 
-    def cut_gray(self, state_image_full):
-        '''
-        ##### TODO #####
-        This function should cut the image at the front end of the car
-        and translate to grey scale
+    def _cut_rows(self, image: npt.NDArray[np.generic]) -> npt.NDArray[np.generic]:
+        """Keep the cut_size BEV rows closest to the car and reorder them so row 0 is nearest the car.
 
-        input:
-            state_image_full 320x240x3
+        Parameters
+        ----------
+        image : (ImageHeight x ImageWidth x ...) array
+            Any BEV-aligned array, e.g. the BEV image or the BEV validity mask.
 
-        output:
-            gray_state_image 320x120x1
+        Returns
+        -------
+        (CutSize x ImageWidth x ...) array
+            Rows nearest the car, in order of increasing distance.
+        """
+        return image[-self.cut_size:][::-1]
 
-        '''
-        
-        return gray_state_image[::-1] 
+
+    def cut_gray(self, state_image_full: npt.NDArray[np.uint8]) -> npt.NDArray[np.float64]:
+        """Crop the BEV image to the region just ahead of the car and convert it to grey scale.
+
+        Parameters
+        ----------
+        state_image_full : (ImageHeight x ImageWidth x 3) array
+            RGB BEV image from front2bev.
+
+        Returns
+        -------
+        (CutSize x ImageWidth) array
+            Grey scale intensities in [0, 255]. Row 0 is the row nearest the car, so the row index grows
+            with distance ahead, as find_first_lane_point expects.
+        """
+        # luma weights, the same ones cv2.COLOR_RGB2GRAY uses
+        luma_weights = np.array([0.299, 0.587, 0.114])
+        gray_state_image: npt.NDArray[np.float64] = self._cut_rows(state_image_full) @ luma_weights
+        return gray_state_image
 
 
-    def edge_detection(self, gray_image):
-        '''
-        ##### TODO #####
-        In order to find edges in the gray state image, 
-        this function should derive the absolute gradients of the gray state image.
-        Derive the absolute gradients using numpy for each pixel. 
-        To ignore small gradients, set all gradients below a threshold (self.gradient_threshold) to zero. 
+    def edge_detection(self, gray_image: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+        """Compute the thresholded absolute gradient magnitude of the grey scale image.
 
-        input:
-            gray_state_image 320x120x1
+        Parameters
+        ----------
+        gray_image : (CutSize x ImageWidth) array
+            Grey scale image from cut_gray.
 
-        output:
-            gradient_sum 320x120x1
+        Returns
+        -------
+        (CutSize x ImageWidth) array
+            |dI/dx| + |dI/dy| per pixel. Values below self.gradient_threshold, and pixels on or outside the
+            border of the camera's field of view in the BEV, are set to zero.
+        """
 
-        '''
-        
+        # First array is the gradient vertically (changes vertically), second is horizontal
+        grad_rows, grad_cols = np.gradient(gray_image)
+
+        # The L1 norm approach
+        gradient_sum: npt.NDArray[np.float64] = np.abs(grad_rows) + np.abs(grad_cols)
+
+        # Deactivate any pixel where the gradient doesn't meet our edge threshold
+        gradient_sum[gradient_sum < self.gradient_threshold] = 0.0
+        gradient_sum[~self._cut_rows(self.bev_valid_mask)] = 0.0
         return gradient_sum
 
 
-    def find_maxima_gradient_rowwise(self, gradient_sum):
-        '''
-        ##### TODO #####
-        This function should output arguments of local maxima for each row of the gradient image.
-        You can use scipy.signal.find_peaks to detect maxima. 
-        Hint: Use distance argument for a better robustness.
+    def find_maxima_gradient_rowwise(self, gradient_sum: npt.NDArray[np.float64]) -> npt.NDArray[np.int64]:
+        """Find the local maxima of the gradient image in every row.
 
-        input:
-            gradient_sum 320x120x1
+        Parameters
+        ----------
+        gradient_sum : (CutSize x ImageWidth) array
+            Thresholded gradient image from edge_detection.
 
-        output:
-            maxima (np.array) 2x Number_maxima
-
-        '''
-
+        Returns
+        -------
+        (2 x NumMaxima) array
+            Pixel coordinates of every maximum: row 0 holds the column (x) and row 1 holds the row (y), the
+            same (x, y) order used for the lane boundary points.
+        """
+        cols_per_row: list[npt.NDArray[np.int64]] = [
+            find_peaks(row, distance=self.distance_maxima_gradient)[0] for row in gradient_sum
+        ]
+        rows_per_row: list[npt.NDArray[np.int64]] = [
+            np.full(cols.shape[0], row_idx, dtype=np.int64) for row_idx, cols in enumerate(cols_per_row)
+        ]
+        argmaxima: npt.NDArray[np.int64] = np.stack([np.concatenate(cols_per_row), np.concatenate(rows_per_row)])
         return argmaxima
 
 
