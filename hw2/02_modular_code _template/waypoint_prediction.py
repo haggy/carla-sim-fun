@@ -24,26 +24,51 @@ def normalize(v: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
 
 
 def curvature(waypoints: npt.NDArray[np.float64]) -> float:
+    """Second term of the smoothing objective: summed cosines of the turning angles along the path.
+
+    For consecutive path segments d_n = x_{n+1} - x_n, the normalised dot product d_n . d_{n-1} / (|d_n| |d_{n-1}|)
+    is the cosine of the angle the path turns at waypoint n: 1 when it continues straight, 0 at a right angle and
+    -1 when it doubles back. The sum therefore peaks at N - 2 for a straight line, and maximising it penalises
+    every bend, whatever the segment lengths.
+
+    Parameters
+    ----------
+    waypoints : (2 x NumWaypoints) array
+        (x, y) waypoints, ordered along the path.
+
+    Returns
+    -------
+    float
+        Sum over the NumWaypoints - 2 interior waypoints of the cosine of the turning angle, in [-(N-2), N-2].
     """
-    ##### TODO ##### (unit 2B)
-    Curvature as the sum of the normalized dot product between the way elements
-    Implement second term of the smoothin objective.
+    segments = normalize(np.diff(waypoints, axis=1))
+    return float(np.sum(segments[:, 1:] * segments[:, :-1]))
 
-    args:
-        waypoints [2, num_waypoints] !!!!!
+
+def smoothing_objective(
+    waypoints: npt.NDArray[np.float64],
+    waypoints_center: npt.NDArray[np.float64],
+    weight_curvature: float = 40,
+) -> float:
+    """Objective for path smoothing: stay close to the centre waypoints, but turn as little as possible.
+
+    The template uses the mean instead of the assignment's sum of squared distances, so with 2 x NumWaypoints
+    coordinates weight_curvature corresponds to beta / (2 * NumWaypoints) in the assignment's formula.
+
+    Parameters
+    ----------
+    waypoints : (2 * NumWaypoints,) array
+        Candidate waypoints, flattened as [x_1..x_N, y_1..y_N].
+    waypoints_center : (2 * NumWaypoints,) array
+        Centre waypoints from the "center" prediction, flattened the same way.
+    weight_curvature : float
+        Weight of the curvature term.
+
+    Returns
+    -------
+    float
+        Objective value to minimise.
     """
-    raise NotImplementedError('curvature is implemented in unit 2B')
-
-
-def smoothing_objective(waypoints, waypoints_center, weight_curvature=40):
-    '''
-    Objective for path smoothing
-
-    args:
-        waypoints [2 * num_waypoints] !!!!!
-        waypoints_center [2 * num_waypoints] !!!!!
-        weight_curvature (default=40)
-    '''
     # mean least square error between waypoint and way point center
     ls_tocenter = np.mean((waypoints_center - waypoints)**2)
 
@@ -74,7 +99,8 @@ def waypoint_prediction(
     num_waypoints : int
         Number of waypoints, including the one at spline parameter 0.
     way_type : str
-        "center" for the midpoints between the boundaries, "smooth" for the path-smoothed waypoints (unit 2B).
+        "center" for the midpoints between the boundaries, "smooth" for waypoints that minimise
+        smoothing_objective starting from the centre waypoints.
 
     Returns
     -------
@@ -90,8 +116,11 @@ def waypoint_prediction(
         return way_points_center
 
     elif way_type == "smooth":
-        ##### TODO ##### (unit 2B)
-        raise NotImplementedError('path smoothing is implemented in unit 2B')
+        # optimization
+        way_points = minimize(smoothing_objective,
+                              way_points_center.flatten(),
+                              args=(way_points_center.flatten(),))["x"]
+        return way_points.reshape(2, -1)
 
     raise ValueError(f'unknown way_type {way_type!r}; expected "center" or "smooth"')
 
