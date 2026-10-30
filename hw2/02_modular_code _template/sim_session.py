@@ -175,18 +175,23 @@ class CarlaSession:
     """Context manager owning the simulation for one live test run.
 
     Entering connects, loads the town, switches to synchronous mode and spawns the ego vehicle (autopilot unless
-    --manual), NPC traffic and the front camera. Leaving destroys everything and restores the world settings.
+    --manual or autopilot=False), NPC traffic and the front camera. Leaving destroys everything and restores the
+    world settings.
     """
 
-    def __init__(self, args: argparse.Namespace) -> None:
+    def __init__(self, args: argparse.Namespace, autopilot: bool = True) -> None:
         """Store the options from build_arg_parser; nothing is spawned until the session is entered.
 
         Parameters
         ----------
         args : argparse.Namespace
             Parsed options from build_arg_parser.
+        autopilot : bool
+            Let the traffic manager drive the ego vehicle unless --manual is given. False for tests whose own
+            controller passes its command to tick().
         """
         self.args = args
+        self.autopilot = autopilot and not args.manual
         self.driver = KeyboardDriver()
         self.vehicle: carla.Actor | None = None
         self._npcs: list[carla.Actor] = []
@@ -228,7 +233,7 @@ class CarlaSession:
                     break
             if self.vehicle is None:
                 raise RuntimeError('No free spawn point for the ego vehicle.')
-            self.vehicle.set_autopilot(not args.manual, self.traffic_manager.get_port())
+            self.vehicle.set_autopilot(self.autopilot, self.traffic_manager.get_port())
 
             npc_blueprints = [bp for bp in blueprints.filter('vehicle.*')
                               if int(bp.get_attribute('number_of_wheels')) == 4]
@@ -287,17 +292,23 @@ class CarlaSession:
         """
         return self.vehicle.get_velocity().length()
 
-    def tick(self) -> npt.NDArray[np.uint8]:
+    def tick(self, control: carla.VehicleControl | None = None) -> npt.NDArray[np.uint8]:
         """Advance the simulation one step and return the matching front camera frame.
 
-        In --manual mode the arrow-key command is applied before the tick.
+        Parameters
+        ----------
+        control : carla.VehicleControl or None
+            Command to apply before the tick. If None, the arrow-key command is applied in --manual mode and the
+            autopilot (if enabled) keeps driving otherwise.
 
         Returns
         -------
         (ImageHeight x ImageWidth x 3) array
             RGB front camera image of this tick.
         """
-        if self.args.manual:
+        if control is not None:
+            self.vehicle.apply_control(control)
+        elif self.args.manual:
             self.vehicle.apply_control(self.driver.control(self.speed_mps))
         frame_id = self.world.tick()
         image = self._frames.get(timeout=FRAME_TIMEOUT_SECONDS)

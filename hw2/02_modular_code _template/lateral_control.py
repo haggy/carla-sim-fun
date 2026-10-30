@@ -1,54 +1,76 @@
 import numpy as np
-import matplotlib.pyplot as plt
-from scipy.signal import find_peaks
-from scipy.interpolate import splprep, splev
-from scipy.optimize import minimize
-import time
+import numpy.typing as npt
 
 
 class LateralController:
-    '''
-    Lateral control using the Stanley controller
+    """Lateral control with the Stanley controller (assignment eq. 3).
 
-    functions:
-        stanley 
+    Waypoints are in the lane detector's cut coordinates: x in BEV pixels (right positive), y in rows ahead of the
+    car, with the car at car_position heading +y. Steering angles are in radians, positive to the right, which
+    matches CARLA's steer sign.
+    """
 
-    init:
-        gain_constant (default=5)
-        damping_constant (default=0.5)
-    '''
+    def __init__(
+        self,
+        gain_constant: float = 3,
+        damping_constant: float = 0.6,
+        car_position: tuple[float, float] = (160.0, 0.0),
+        metres_per_pixel: float = 0.075,
+        max_steering_angle: float = 0.4,
+        full_lock_angle: float = np.radians(70.0),
+    ) -> None:
+        """Set the controller parameters.
 
-
-    def __init__(self, gain_constant=5, damping_constant=0.6):
-
+        Parameters
+        ----------
+        gain_constant : float
+            k in eq. 3, in 1/s: how strongly a cross-track error of 1 m is corrected at 1 m/s. Tuned in unit 3B
+            on Town01 with the ground-truth path.
+        damping_constant : float
+            D in eq. 4 (unit 3C); not used yet.
+        car_position : tuple[float, float]
+            (x, y) of the car in cut coordinates, LaneDetection.car_position.
+        metres_per_pixel : float
+            Ground size of a cut/BEV pixel (LaneDetection.bev_metres_per_pixel), so the cross-track error is in
+            metres to match the speed in m/s.
+        max_steering_angle : float
+            Largest wheel angle the controller commands, in radians.
+        full_lock_angle : float
+            Wheel angle at CARLA steer = 1, in radians (70 deg for the Lincoln MKZ ego vehicle).
+        """
         self.gain_constant = gain_constant
         self.damping_constant = damping_constant
-        self.previous_steering_angle = 0
+        self.car_position = np.asarray(car_position, dtype=np.float64)
+        self.metres_per_pixel = metres_per_pixel
+        self.max_steering_angle = max_steering_angle
+        self.full_lock_angle = full_lock_angle
+        self.previous_steering_angle = 0.0
 
+    def stanley(self, waypoints: npt.NDArray[np.float64], speed: float) -> float:
+        """One step of the Stanley controller.
 
-    def stanley(self, waypoints, speed):
-        '''
-        ##### TODO #####
-        one step of the stanley controller with damping
-        args:
-            waypoints (np.array) [2, num_waypoints]
-            speed (float)
-        '''
-        # derive orientation error as the angle of the first path segment to the car orientation
+        Parameters
+        ----------
+        waypoints : (2 x NumWaypoints) array
+            (x, y) waypoints from waypoint_prediction, nearest first; at least two.
+        speed : float
+            Vehicle speed in m/s.
 
-        # derive cross track error as distance between desired waypoint at spline parameter equal zero ot the car position
+        Returns
+        -------
+        float
+            CARLA steer command in [-1, 1]: the wheel angle, clipped to max_steering_angle, as a fraction of
+            full_lock_angle.
+        """
+        # Orientation error: heading of the first path segment relative to the car's +y axis.
+        segment = waypoints[:, 1] - waypoints[:, 0]
+        orientation_error = np.arctan2(segment[0], segment[1])
 
-        # derive stanley control law
-        # prevent division by zero by adding as small epsilon
+        # Cross-track error at the reference point, positive when the path lies to the right of the car.
+        cross_track_error = (waypoints[0, 0] - self.car_position[0]) * self.metres_per_pixel
 
-        # derive damping term
-        
-        steering_angle =
-        # clip to the maximum stering angle (0.4) and rescale the steering action space
-        return np.clip(steering_angle, -0.4, 0.4) / 0.4
+        steering_angle = orientation_error + np.arctan(self.gain_constant * cross_track_error / (speed + 1e-3))
 
-
-
-
-
-
+        steering_angle = float(np.clip(steering_angle, -self.max_steering_angle, self.max_steering_angle))
+        self.previous_steering_angle = steering_angle
+        return steering_angle / self.full_lock_angle

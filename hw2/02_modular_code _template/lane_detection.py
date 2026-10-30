@@ -732,6 +732,22 @@ class LaneDetection:
         return np.stack([points[0], height - 1 - points[1]])
 
 
+    def bev_to_cut(self, points: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+        """Convert points from BEV image pixel coordinates to cut_gray coordinates (inverse of cut_to_bev_pixels).
+
+        Parameters
+        ----------
+        points : (2 x NumPoints) array
+            (u, v) pixel coordinates in the BEV image, v counted down from the top row.
+
+        Returns
+        -------
+        (2 x NumPoints) array
+            (x, y) points with y counted in rows ahead of the car.
+        """
+        height = self.image_size[0]
+        return np.stack([points[0], height - 1 - points[1]])
+
     def cut_to_front_view(self, points: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
         """Project points from cut_gray coordinates into the front camera image.
 
