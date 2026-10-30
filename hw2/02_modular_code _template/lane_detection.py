@@ -31,6 +31,7 @@ class LaneDetection:
         camera_xyz: tuple[float, float, float] = (0.0, 0.0, 2.0),
         bev_forward_range_m: tuple[float, float] = (3.0, 21.0),
         bev_lateral_range_m: tuple[float, float] = (-12.0, 12.0),
+        obstacle_margin_px: int = 3,
     ) -> None:
         """Configure the lane detector and precompute the front-view to BEV homography.
 
@@ -59,6 +60,8 @@ class LaneDetection:
             2 m with a 90 deg FOV sees no ground closer than ~2.7 m, so a smaller near limit leaves empty rows.
         bev_lateral_range_m : tuple[float, float]
             (left, right) lateral extent covered by the BEV image, in metres. Left is negative.
+        obstacle_margin_px : int
+            Front-view pixels the obstacle masks are grown by before they are warped to the BEV.
         """
         self.car_position = np.array([160,0])
         self.spline_smoothness = spline_smoothness
@@ -68,6 +71,7 @@ class LaneDetection:
         self.lane_boundary1_old = 0
         self.lane_boundary2_old = 0
         self.image_size = image_size
+        self.obstacle_margin_px = obstacle_margin_px
         self.H_bev2im: npt.NDArray[np.float64] = self._bev_to_image_homography(
             image_size, camera_fov_deg, camera_xyz, bev_forward_range_m, bev_lateral_range_m)
 
@@ -157,18 +161,68 @@ class LaneDetection:
             BEV image with the vehicle at the bottom centre and forward pointing up. Ground outside the
             camera's field of view is black, which makes wedges in the near corners.
         """
+        bev_image: npt.NDArray[np.uint8] = self._warp_to_bev(front_view_image, cv2.INTER_LINEAR)
+        return bev_image
+
+
+    def _warp_to_bev(self, front_view: npt.NDArray[np.uint8], interpolation: int) -> npt.NDArray[np.uint8]:
+        """Apply the ground-plane homography to any front-view-aligned array.
+
+        Parameters
+        ----------
+        front_view : (ImageHeight x ImageWidth x ...) array
+            Front-view image or mask.
+        interpolation : int
+            cv2 interpolation flag, e.g. cv2.INTER_LINEAR for images or cv2.INTER_NEAREST for masks.
+
+        Returns
+        -------
+        (ImageHeight x ImageWidth x ...) array
+            BEV-aligned array; pixels outside the camera's field of view are 0.
+        """
         height, width = self.image_size
 
         # H_bev2im already maps destination -> source, so pass WARP_INVERSE_MAP to skip a matrix inversion.
-        bev_image: npt.NDArray[np.uint8] = cv2.warpPerspective(
-            front_view_image,
+        warped: npt.NDArray[np.uint8] = cv2.warpPerspective(
+            front_view,
             self.H_bev2im,
             (width, height),
-            flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+            flags=interpolation | cv2.WARP_INVERSE_MAP,
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=0,
         )
-        return bev_image
+        return warped
+
+
+    def obstacle_mask_to_bev(self, obstacle_mask: npt.NDArray[np.bool_]) -> npt.NDArray[np.bool_]:
+        """Project a front-view obstacle segmentation mask into the BEV.
+
+        Obstacles are not on the ground plane, so the homography smears them away from the camera into long
+        streaks. Warping the mask with the same homography as the image produces exactly the same streak, so the
+        BEV mask covers every BEV pixel the obstacle's image pixels landed on.
+
+        Parameters
+        ----------
+        obstacle_mask : (ImageHeight x ImageWidth) array
+            True where an obstacle covers the front-view pixel, e.g. DetectionResult.obstacle_mask().
+
+        Returns
+        -------
+        (ImageHeight x ImageWidth) array
+            True where the BEV pixel shows an obstacle.
+        """
+        mask_u8: npt.NDArray[np.uint8] = obstacle_mask.astype(np.uint8)
+
+        # Segmentation masks stop slightly inside the object outline, yet the strongest gradients sit exactly on
+        # that outline. Growing the mask in the front view keeps the margin a constant size in the camera image,
+        # so after the warp it scales with distance the same way the obstacle does.
+        if self.obstacle_margin_px > 0:
+            kernel_size = 2 * self.obstacle_margin_px + 1
+            mask_u8 = cv2.dilate(mask_u8, np.ones((kernel_size, kernel_size), np.uint8))
+
+        # Nearest neighbour keeps the mask binary.
+        obstacle_mask_bev: npt.NDArray[np.bool_] = self._warp_to_bev(mask_u8, cv2.INTER_NEAREST) > 0
+        return obstacle_mask_bev
 
 
     def _cut_rows(self, image: npt.NDArray[np.generic]) -> npt.NDArray[np.generic]:
@@ -207,19 +261,26 @@ class LaneDetection:
         return gray_state_image
 
 
-    def edge_detection(self, gray_image: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+    def edge_detection(
+        self,
+        gray_image: npt.NDArray[np.float64],
+        obstacle_mask_bev: npt.NDArray[np.bool_] | None = None,
+    ) -> npt.NDArray[np.float64]:
         """Compute the thresholded absolute gradient magnitude of the grey scale image.
 
         Parameters
         ----------
         gray_image : (CutSize x ImageWidth) array
             Grey scale image from cut_gray.
+        obstacle_mask_bev : (ImageHeight x ImageWidth) array or None
+            Full BEV obstacle mask from obstacle_mask_to_bev. Obstacle outlines are strong edges that are not
+            lane markings, so gradients under the mask are discarded. None skips obstacle suppression.
 
         Returns
         -------
         (CutSize x ImageWidth) array
-            |dI/dx| + |dI/dy| per pixel. Values below self.gradient_threshold, and pixels on or outside the
-            border of the camera's field of view in the BEV, are set to zero.
+            |dI/dx| + |dI/dy| per pixel. Values below self.gradient_threshold, pixels on or outside the border
+            of the camera's field of view in the BEV, and pixels covered by obstacles are set to zero.
         """
 
         # First array is the gradient vertically (changes vertically), second is horizontal
@@ -231,6 +292,8 @@ class LaneDetection:
         # Deactivate any pixel where the gradient doesn't meet our edge threshold
         gradient_sum[gradient_sum < self.gradient_threshold] = 0.0
         gradient_sum[~self._cut_rows(self.bev_valid_mask)] = 0.0
+        if obstacle_mask_bev is not None:
+            gradient_sum[self._cut_rows(obstacle_mask_bev)] = 0.0
         return gradient_sum
 
 
@@ -319,24 +382,36 @@ class LaneDetection:
         return lane_boundary1_startpoint, lane_boundary2_startpoint, lanes_found
 
 
-    def lane_detection(self, state_image_full):
-        '''
-        ##### TODO #####
-        This function should perform the road detection 
+    def lane_detection(
+        self,
+        state_image_full: npt.NDArray[np.uint8],
+        obstacle_mask: npt.NDArray[np.bool_] | None = None,
+    ):
+        """Detect the two lane boundaries of the ego lane.
 
-        args:
-            state_image_full [320, 240, 3]
+        ##### TODO ##### (units 1D/1E: edge assignment and spline fitting)
 
-        out:
-            lane_boundary1 spline
-            lane_boundary2 spline
-        '''
+        Parameters
+        ----------
+        state_image_full : (ImageHeight x ImageWidth x 3) array
+            RGB front camera image.
+        obstacle_mask : (ImageHeight x ImageWidth) array or None
+            Front-view obstacle mask, e.g. ObjectDetection.detect(...).obstacle_mask(). Edges on obstacles are
+            ignored. None disables obstacle suppression.
+
+        Returns
+        -------
+        lane_boundary1, lane_boundary2
+            Splines of the two lane boundaries.
+        """
+        bev = self.front2bev(state_image_full)
+        obstacle_mask_bev = self.obstacle_mask_to_bev(obstacle_mask) if obstacle_mask is not None else None
 
         # to gray
-        gray_state = self.cut_gray(state_image_full)
+        gray_state = self.cut_gray(bev)
 
         # edge detection via gradient sum and thresholding
-        gradient_sum = self.edge_detection(gray_state)
+        gradient_sum = self.edge_detection(gray_state, obstacle_mask_bev)
         maxima = self.find_maxima_gradient_rowwise(gradient_sum)
 
         # first lane_boundary points
