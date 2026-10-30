@@ -48,22 +48,16 @@ class LaneDetectionFrame:
 
 
 class LaneDetection:
-    '''
-    Lane detection module using edge detection and b-spline fitting
+    """Lane detection module: BEV projection, edge detection, edge-to-boundary assignment and B-spline fitting.
 
-    args: 
-        cut_size (cut_size=120) cut the image at the front of the car
-        spline_smoothness (default=10)
-        gradient_threshold (default=14)
-        distance_maxima_gradient (default=3)
-
-    '''
+    See __init__ for the parameters.
+    """
 
     def __init__(
         self,
         cut_size: int = 120,
-        spline_smoothness: float = 10,
-        gradient_threshold: float = 14,
+        spline_smoothness: float = 100,
+        gradient_threshold: float = 10,
         distance_maxima_gradient: int = 3,
         image_size: tuple[int, int] = (240, 320),
         camera_fov_deg: float = 90.0,
@@ -77,6 +71,8 @@ class LaneDetection:
         min_lane_width_px: float = 20.0,
         min_boundary_points: int = 10,
         max_start_attempts: int = 5,
+        max_lateral_jump_px: float = 4.0,
+        max_lateral_slope: float = 0.3,
     ) -> None:
         """Configure the lane detector and precompute the front-view to BEV homography.
 
@@ -88,9 +84,14 @@ class LaneDetection:
         cut_size : int
             Number of BEV rows, counted from the car, that are kept for lane detection.
         spline_smoothness : float
-            Smoothing factor `s` passed to scipy.interpolate.splprep.
+            Smoothing factor `s` passed to scipy.interpolate.splprep: an upper bound on the summed squared pixel
+            distance between the boundary points and the spline. Tuned in unit 1F: accuracy is insensitive to it,
+            but below ~30 the spline follows the 1 px quantisation of the maxima and turns by 50-400 deg over 9 m;
+            from ~100 (about the number of points per boundary) it stops tracking that noise.
         gradient_threshold : float
-            Absolute gradients below this value are zeroed during edge detection.
+            Absolute gradients below this value are zeroed during edge detection. Tuned in unit 1F against map
+            ground truth: Town01's faint, wet markings need <= 10, while Town10's high-contrast scenes do best at
+            12-14; 10 balances the two.
         distance_maxima_gradient : int
             Minimum pixel distance between neighbouring row-wise gradient maxima.
         image_size : tuple[int, int]
@@ -123,6 +124,12 @@ class LaneDetection:
             start candidate.
         max_start_attempts : int
             Maximum number of start points tried per lane boundary.
+        max_lateral_jump_px : float
+            While tracing, a candidate maximum is rejected outright if its sideways offset from the boundary's
+            extrapolated direction exceeds max_lateral_jump_px + max_lateral_slope * (its distance ahead of the
+            last boundary point).
+        max_lateral_slope : float
+            See max_lateral_jump_px.
         """
         # The car sits at the bottom centre of the BEV, which is row 0 after cut_gray flips the rows.
         self.car_position: npt.NDArray[np.int64] = np.array([image_size[1] // 2, 0])
@@ -141,6 +148,8 @@ class LaneDetection:
         self.min_lane_width_px = min_lane_width_px
         self.min_boundary_points = min_boundary_points
         self.max_start_attempts = max_start_attempts
+        self.max_lateral_jump_px = max_lateral_jump_px
+        self.max_lateral_slope = max_lateral_slope
         self.H_bev2im: npt.NDArray[np.float64] = self._bev_to_image_homography(
             image_size, camera_fov_deg, camera_xyz, bev_forward_range_m, bev_lateral_range_m)
 
@@ -496,6 +505,11 @@ class LaneDetection:
             forward = maxima[1, candidates] - last[1]
             lateral = maxima[0, candidates] - (last[0] + slope * forward)
             distance = np.hypot(self.lateral_distance_weight * lateral, forward)
+
+            # Lane lines change direction slowly, while texture, puddle and shadow edges scatter in every direction.
+            # The weighted distance alone still allows a sideways hop when the candidate sits in the next row, so
+            # offsets beyond a cone around the extrapolated direction are excluded outright.
+            distance[np.abs(lateral) > self.max_lateral_jump_px + self.max_lateral_slope * forward] = np.inf
 
             nearest = int(np.argmin(distance))
             if distance[nearest] >= self.max_assignment_distance_px:

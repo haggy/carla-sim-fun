@@ -81,6 +81,9 @@ class ObjectDetection:
         Opacity of the mask overlay in [0, 1].
     box_thickness : int
         Line thickness of the drawn boxes, in pixels.
+    ego_hood_top_fraction : float
+        Detections whose box touches the bottom image edge and starts below this fraction of the image height are
+        dropped as the ego vehicle's own hood.
     """
     model_weight_file: str = "yolo26n-seg.pt"
     confidence_threshold: float = 0.3
@@ -93,6 +96,10 @@ class ObjectDetection:
     mask_color: tuple[int, int, int] = (255, 0, 255)
     mask_alpha: float = 0.45
     box_thickness: int = 1
+    # The hw2 camera sees the ego hood in roughly the bottom 15% of the frame, and YOLO calls it a car in ~10% of
+    # frames. A real obstacle close enough to reach the bottom edge would be over 1.4 m tall and reach well above
+    # this line, so it is not dropped.
+    ego_hood_top_fraction: float = 0.75
 
     def __post_init__(self) -> None:
         """Load the model once; it is reused for every frame."""
@@ -132,11 +139,13 @@ class ObjectDetection:
             result.masks.data > 0.5 if result.masks is not None
             else np.zeros((0, height, width), dtype=bool)
         )
+        boxes: npt.NDArray[np.float32] = result.boxes.xyxy.astype(np.float32)
+        is_ego_hood = (boxes[:, 3] >= height - 2) & (boxes[:, 1] >= self.ego_hood_top_fraction * height)
         return DetectionResult(
-            boxes_xyxy=result.boxes.xyxy.astype(np.float32),
-            class_ids=result.boxes.cls.astype(np.int64),
-            confidences=result.boxes.conf.astype(np.float32),
-            masks=masks,
+            boxes_xyxy=boxes[~is_ego_hood],
+            class_ids=result.boxes.cls.astype(np.int64)[~is_ego_hood],
+            confidences=result.boxes.conf.astype(np.float32)[~is_ego_hood],
+            masks=masks[~is_ego_hood],
             class_names=dict(result.names),
         )
 

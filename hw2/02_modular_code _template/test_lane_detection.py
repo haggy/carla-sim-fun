@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import carla
+import matplotlib.backend_bases
 import matplotlib.pyplot as plt
 import numpy as np
 import numpy.typing as npt
@@ -35,8 +36,8 @@ def parse_args() -> argparse.Namespace:
     Returns
     -------
     argparse.Namespace
-        host, port, steps (0 runs until the window is closed), seed, npcs (traffic vehicle count) and save
-        (snapshot path or None).
+        host, port, steps (0 runs until the window is closed), seed, npcs (traffic vehicle count), manual
+        (arrow-key driving instead of autopilot), snapshot_dir, snapshot_every and save (path or None).
     """
     parser = argparse.ArgumentParser(
         description='Live test of LaneDetection BEV, edge detection and obstacle detection in CARLA.')
@@ -45,8 +46,81 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--steps', type=int, default=0, help='Number of simulation steps; 0 runs until closed.')
     parser.add_argument('--seed', type=int, default=None, help='Seed for the spawn point choice.')
     parser.add_argument('--npcs', type=int, default=30, help='Autopilot traffic vehicles to spawn as obstacles.')
+    parser.add_argument('--manual', action='store_true',
+                        help='Drive with the arrow keys (focus the plot window) instead of the autopilot.')
+    parser.add_argument('--snapshot-dir', type=Path, default=Path('lane_detection_snapshots'),
+                        help="Folder for snapshots taken with the 's' key or --snapshot-every.")
+    parser.add_argument('--snapshot-every', type=int, default=0,
+                        help='Also save a snapshot every N steps; 0 disables periodic snapshots.')
     parser.add_argument('--save', type=Path, default=None, help='Save the last plotted figure to this path.')
     return parser.parse_args()
+
+
+class KeyboardDriver:
+    """Arrow-key vehicle control from matplotlib key events.
+
+    Up accelerates, down brakes (and reverses once stopped), left/right steer. Steering ramps towards full lock
+    while a key is held and recentres when released, so a tap gives a small correction instead of a jerk.
+    """
+
+    THROTTLE = 0.6
+    STEER_LIMIT = 0.5
+    STEER_RATE = 0.08
+    REVERSE_BELOW_MPS = 0.5
+
+    def __init__(self) -> None:
+        """Start with no keys held and the wheels straight."""
+        self.held: set[str] = set()
+        self.steer = 0.0
+        self.snapshot_requested = False
+
+    def on_press(self, event: matplotlib.backend_bases.KeyEvent) -> None:
+        """Record a pressed key.
+
+        Parameters
+        ----------
+        event : matplotlib.backend_bases.KeyEvent
+            Key press from the figure canvas.
+        """
+        if event.key == 's':
+            self.snapshot_requested = True
+        elif event.key is not None:
+            self.held.add(event.key)
+
+    def on_release(self, event: matplotlib.backend_bases.KeyEvent) -> None:
+        """Record a released key.
+
+        Parameters
+        ----------
+        event : matplotlib.backend_bases.KeyEvent
+            Key release from the figure canvas.
+        """
+        self.held.discard(event.key)
+
+    def control(self, speed_mps: float) -> carla.VehicleControl:
+        """Vehicle command for the keys currently held.
+
+        Parameters
+        ----------
+        speed_mps : float
+            Current vehicle speed, used to switch the down key from braking to reversing.
+
+        Returns
+        -------
+        carla.VehicleControl
+            Throttle, brake, steer and reverse for this tick.
+        """
+        target = self.STEER_LIMIT * (('right' in self.held) - ('left' in self.held))
+        self.steer += float(np.clip(target - self.steer, -self.STEER_RATE, self.STEER_RATE))
+
+        control = carla.VehicleControl(steer=self.steer)
+        if 'up' in self.held:
+            control.throttle = self.THROTTLE
+        elif 'down' in self.held and speed_mps < self.REVERSE_BELOW_MPS:
+            control.throttle, control.reverse = self.THROTTLE, True
+        elif 'down' in self.held:
+            control.brake = 1.0
+        return control
 
 
 def carla_image_to_rgb(image: carla.Image) -> npt.NDArray[np.uint8]:
@@ -165,7 +239,8 @@ def plot_step(
 
 
 def main() -> None:
-    """Drive an autopilot vehicle in synchronous mode and run obstacle and lane detection on every frame."""
+    """Drive the ego vehicle (autopilot or arrow keys) in synchronous mode and run obstacle and lane detection
+    on every frame."""
     args = parse_args()
     random.seed(args.seed)
 
@@ -194,7 +269,7 @@ def main() -> None:
                 break
         if vehicle is None:
             raise RuntimeError('No free spawn point for the ego vehicle.')
-        vehicle.set_autopilot(True, traffic_manager.get_port())
+        vehicle.set_autopilot(not args.manual, traffic_manager.get_port())
 
         npc_blueprints = [bp for bp in world.get_blueprint_library().filter('vehicle.*')
                           if int(bp.get_attribute('number_of_wheels')) == 4]
@@ -211,7 +286,14 @@ def main() -> None:
         LD_module = LaneDetection()
         obj_detection = ObjectDetection()
 
+        # Matplotlib binds the arrow keys to toolbar navigation and "s" to its save dialog by default, which would
+        # fight the driving and snapshot keys.
+        for keymap in ('keymap.back', 'keymap.forward', 'keymap.save'):
+            plt.rcParams[keymap] = []
         fig, axes = plt.subplots(2, 2, figsize=(11, 8))
+        driver = KeyboardDriver()
+        fig.canvas.mpl_connect('key_press_event', driver.on_press)
+        fig.canvas.mpl_connect('key_release_event', driver.on_release)
         plt.ion()
         plt.show()
 
@@ -223,13 +305,16 @@ def main() -> None:
             while image.frame < frame_id:
                 image = frames.get(timeout=FRAME_TIMEOUT_SECONDS)
             move_spectator_to_vehicle(world, vehicle)
+            if args.manual:
+                vehicle.apply_control(driver.control(vehicle.get_velocity().length()))
 
             front = carla_image_to_rgb(image)
             detections: DetectionResult = obj_detection.detect(front)
 
             splines = LD_module.lane_detection(front, detections.obstacle_mask())
 
-            if step % 2 == 0:
+            snapshot_due = args.snapshot_every > 0 and step % args.snapshot_every == 0
+            if step % 2 == 0 or snapshot_due or driver.snapshot_requested:
                 plot_step(
                     axes,
                     LD_module,
@@ -239,6 +324,10 @@ def main() -> None:
                     splines,
                     step,
                 )
+            if snapshot_due or driver.snapshot_requested:
+                args.snapshot_dir.mkdir(parents=True, exist_ok=True)
+                fig.savefig(args.snapshot_dir / f'step_{step:05d}.png', dpi=100)
+                driver.snapshot_requested = False
             step += 1
 
             if not plt.fignum_exists(fig.number):
