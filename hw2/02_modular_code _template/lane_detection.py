@@ -1,11 +1,50 @@
+from dataclasses import dataclass
+
 import cv2
 import numpy as np
 import numpy.typing as npt
+import matplotlib.figure
 import matplotlib.pyplot as plt
 from scipy.signal import find_peaks
 from scipy.interpolate import splprep, splev
 from scipy.optimize import minimize
 import time
+
+# B-spline as returned by scipy.interpolate.splprep: (knots, [x coefficients, y coefficients], degree).
+Spline = tuple[npt.NDArray[np.float64], list[npt.NDArray[np.float64]], int]
+
+
+@dataclass
+class LaneDetectionFrame:
+    """Intermediate results of one LaneDetection.lane_detection call, kept for visualisation and debugging.
+
+    Attributes
+    ----------
+    bev : (ImageHeight x ImageWidth x 3) array
+        RGB BEV image from front2bev.
+    obstacle_mask_bev : (ImageHeight x ImageWidth) array or None
+        BEV obstacle mask from obstacle_mask_to_bev, None when no obstacle mask was given.
+    gradient_sum : (CutSize x ImageWidth) array
+        Thresholded gradients from edge_detection, row 0 nearest the car.
+    maxima : (2 x NumMaxima) array
+        (x, y) maxima from find_maxima_gradient_rowwise.
+    lane_boundary1_points : (NumBoundary1Points x 2) array
+        (x, y) maxima assigned to the left lane boundary.
+    lane_boundary2_points : (NumBoundary2Points x 2) array
+        (x, y) maxima assigned to the right lane boundary.
+    lane_boundary1_fitted : bool
+        True if the left spline was fitted on this frame, False if the preceding spline was reused.
+    lane_boundary2_fitted : bool
+        True if the right spline was fitted on this frame, False if the preceding spline was reused.
+    """
+    bev: npt.NDArray[np.uint8]
+    obstacle_mask_bev: npt.NDArray[np.bool_] | None
+    gradient_sum: npt.NDArray[np.float64]
+    maxima: npt.NDArray[np.int64]
+    lane_boundary1_points: npt.NDArray[np.int64]
+    lane_boundary2_points: npt.NDArray[np.int64]
+    lane_boundary1_fitted: bool
+    lane_boundary2_fitted: bool
 
 
 class LaneDetection:
@@ -91,8 +130,9 @@ class LaneDetection:
         self.cut_size = cut_size
         self.gradient_threshold = gradient_threshold
         self.distance_maxima_gradient = distance_maxima_gradient
-        self.lane_boundary1_old = 0
-        self.lane_boundary2_old = 0
+        self.lane_boundary1_old: Spline | None = None
+        self.lane_boundary2_old: Spline | None = None
+        self.last_frame: LaneDetectionFrame | None = None
         self.image_size = image_size
         self.obstacle_margin_px = obstacle_margin_px
         self.max_assignment_distance_px = max_assignment_distance_px
@@ -563,14 +603,48 @@ class LaneDetection:
         return best_points
 
 
+    def _fit_spline(self, points: npt.NDArray[np.int64]) -> Spline | None:
+        """Fit a smoothing parametric cubic B-spline through the points of one lane boundary.
+
+        splprep parametrises the curve by normalised cumulative chord length, so the spline parameter runs from
+        0 at the point nearest the car to 1 at the farthest one, roughly proportional to the length travelled
+        along the boundary. smoothing s bounds the sum of squared distances between the points and the curve.
+
+        Parameters
+        ----------
+        points : (NumBoundaryPoints x 2) array
+            (x, y) lane boundary points ordered away from the car.
+
+        Returns
+        -------
+        Spline or None
+            (knots, coefficients, degree) for scipy.interpolate.splev, or None if the points cannot support a
+            cubic spline.
+        """
+        # Repeated consecutive points give a zero chord length, which splprep cannot parametrise.
+        keep: npt.NDArray[np.bool_] = np.ones(points.shape[0], dtype=bool)
+        keep[1:] = np.any(np.diff(points, axis=0) != 0, axis=1)
+        unique_points = points[keep].astype(np.float64)
+
+        # A cubic spline needs more points than its degree.
+        if unique_points.shape[0] <= 3:
+            return None
+        try:
+            tck, _ = splprep([unique_points[:, 0], unique_points[:, 1]], s=self.spline_smoothness, k=3)
+        except ValueError:
+            return None
+        return tck
+
+
     def lane_detection(
         self,
         state_image_full: npt.NDArray[np.uint8],
         obstacle_mask: npt.NDArray[np.bool_] | None = None,
-    ):
+    ) -> tuple[Spline | None, Spline | None]:
         """Detect the two lane boundaries of the ego lane.
 
-        ##### TODO ##### (unit 1E: spline fitting)
+        Each boundary whose points cannot be fitted on this frame falls back to its spline from the preceding
+        frame. The intermediate results are stored in self.last_frame.
 
         Parameters
         ----------
@@ -582,8 +656,11 @@ class LaneDetection:
 
         Returns
         -------
-        lane_boundary1, lane_boundary2
-            Splines of the two lane boundaries.
+        lane_boundary1 : Spline or None
+            Left lane boundary in cut_gray coordinates (x in pixels, y in rows ahead of the car). None until a
+            boundary has been fitted once.
+        lane_boundary2 : Spline or None
+            Right lane boundary, same convention.
         """
         bev = self.front2bev(state_image_full)
         obstacle_mask_bev = self.obstacle_mask_to_bev(obstacle_mask) if obstacle_mask is not None else None
@@ -598,57 +675,97 @@ class LaneDetection:
         lane_boundary1_points, lane_boundary2_points, lane_found = self.assign_lane_boundary_points(
             gradient_sum, maxima)
 
-        # if no lane was found,use lane_boundaries of the preceding step
-        if lane_found:
+        # The template's "more points than spline parameters" check is part of _fit_spline.
+        lane_boundary1 = self._fit_spline(lane_boundary1_points) if lane_found else None
+        lane_boundary2 = self._fit_spline(lane_boundary2_points) if lane_found else None
 
-            ##### TODO #####
-            # spline fitting using scipy.interpolate.splprep 
-            # and the arguments self.spline_smoothness
-            # 
-            # if there are more lane_boundary points points than spline parameters 
-            # else use perceding spline
-            if lane_boundary1_points.shape[0] > 4 and lane_boundary2_points.shape[0] > 4:
-                pass
-                # Pay attention: the first lane_boundary point might occur twice
-                # lane_boundary 1
+        self.last_frame = LaneDetectionFrame(
+            bev=bev,
+            obstacle_mask_bev=obstacle_mask_bev,
+            gradient_sum=gradient_sum,
+            maxima=maxima,
+            lane_boundary1_points=lane_boundary1_points,
+            lane_boundary2_points=lane_boundary2_points,
+            lane_boundary1_fitted=lane_boundary1 is not None,
+            lane_boundary2_fitted=lane_boundary2 is not None,
+        )
 
-                # lane_boundary 2
-                
-            else:
-                lane_boundary1 = self.lane_boundary1_old
-                lane_boundary2 = self.lane_boundary2_old
-            ################
+        if lane_boundary1 is not None:
+            self.lane_boundary1_old = lane_boundary1
+        if lane_boundary2 is not None:
+            self.lane_boundary2_old = lane_boundary2
 
-        else:
-            lane_boundary1 = self.lane_boundary1_old
-            lane_boundary2 = self.lane_boundary2_old
-
-        self.lane_boundary1_old = lane_boundary1
-        self.lane_boundary2_old = lane_boundary2
-
-        # output the spline
-        return lane_boundary1, lane_boundary2
+        return self.lane_boundary1_old, self.lane_boundary2_old
 
 
-    def plot_state_lane(self, state_image_full, steps, fig, waypoints=[]):
-        '''
-        Plot lanes and way points
-        '''
-        # evaluate spline for 6 different spline parameters.
-        t = np.linspace(0, 1, 6)
-        lane_boundary1_points_points = np.array(splev(t, self.lane_boundary1_old))
-        lane_boundary2_points_points = np.array(splev(t, self.lane_boundary2_old))
-        
+    def cut_to_bev_pixels(self, points: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+        """Convert points from cut_gray coordinates to BEV image pixel coordinates.
+
+        Parameters
+        ----------
+        points : (2 x NumPoints) array
+            (x, y) points with y counted in rows ahead of the car, e.g. a sampled spline or waypoints.
+
+        Returns
+        -------
+        (2 x NumPoints) array
+            (u, v) pixel coordinates in the BEV image, v counted down from the top row.
+        """
+        height = self.image_size[0]
+        return np.stack([points[0], height - 1 - points[1]])
+
+
+    def cut_to_front_view(self, points: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+        """Project points from cut_gray coordinates into the front camera image.
+
+        Parameters
+        ----------
+        points : (2 x NumPoints) array
+            (x, y) points with y counted in rows ahead of the car.
+
+        Returns
+        -------
+        (2 x NumPoints) array
+            (u, v) pixel coordinates in the front camera image.
+        """
+        bev_pixels = self.cut_to_bev_pixels(points)
+        homogeneous = self.H_bev2im @ np.vstack([bev_pixels, np.ones(bev_pixels.shape[1])])
+        return homogeneous[:2] / homogeneous[2]
+
+
+    def plot_state_lane(
+        self,
+        state_image_full: npt.NDArray[np.uint8],
+        steps: int,
+        fig: matplotlib.figure.Figure,
+        waypoints: npt.NDArray[np.float64] | None = None,
+    ) -> None:
+        """Plot the BEV of the current frame with the latest lane boundary splines and optional waypoints.
+
+        Parameters
+        ----------
+        state_image_full : (ImageHeight x ImageWidth x 3) array
+            RGB front camera image.
+        steps : int
+            Simulation step, shown in the title.
+        fig : matplotlib.figure.Figure
+            Figure to draw into; it is cleared first.
+        waypoints : (2 x NumWaypoints) array or None
+            (x, y) waypoints in cut_gray coordinates.
+        """
+        plt.figure(fig.number)
         plt.gcf().clear()
-        plt.imshow(state_image_full[::-1])
-        plt.plot(lane_boundary1_points_points[0], lane_boundary1_points_points[1]+320-self.cut_size, linewidth=5, color='orange')
-        plt.plot(lane_boundary2_points_points[0], lane_boundary2_points_points[1]+320-self.cut_size, linewidth=5, color='orange')
-        if len(waypoints):
-            plt.scatter(waypoints[0], waypoints[1]+320-self.cut_size, color='white')
+        plt.imshow(self.front2bev(state_image_full))
 
+        t = np.linspace(0, 1, 20)
+        for spline in (self.lane_boundary1_old, self.lane_boundary2_old):
+            if spline is not None:
+                u, v = self.cut_to_bev_pixels(np.array(splev(t, spline)))
+                plt.plot(u, v, linewidth=3, color='orange')
+        if waypoints is not None and len(waypoints):
+            u, v = self.cut_to_bev_pixels(np.asarray(waypoints, dtype=np.float64))
+            plt.scatter(u, v, color='white')
+
+        plt.title(f'step {steps}')
         plt.axis('off')
-        plt.xlim((-0.5,95.5))
-        plt.ylim((-0.5,95.5))
-        plt.gca().axes.get_xaxis().set_visible(False)
-        plt.gca().axes.get_yaxis().set_visible(False)
         fig.canvas.flush_events()

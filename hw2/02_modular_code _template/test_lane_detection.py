@@ -9,7 +9,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import numpy.typing as npt
 
-from lane_detection import LaneDetection
+from scipy.interpolate import splev
+
+from lane_detection import LaneDetection, Spline
 from object_detection import DetectionResult, ObjectDetection
 
 from PIL import Image
@@ -65,74 +67,105 @@ def carla_image_to_rgb(image: carla.Image) -> npt.NDArray[np.uint8]:
     return bgra[:, :, 2::-1].copy()
 
 
+def sample_spline(spline: Spline | None, num_samples: int = 40) -> npt.NDArray[np.float64]:
+    """Evaluate a lane boundary spline along its full length.
+
+    Parameters
+    ----------
+    spline : Spline or None
+        Lane boundary from LaneDetection.lane_detection.
+    num_samples : int
+        Number of evenly spaced spline parameters in [0, 1].
+
+    Returns
+    -------
+    (2 x NumSamples) array
+        (x, y) points in cut_gray coordinates; empty (2 x 0) if spline is None.
+    """
+    if spline is None:
+        return np.zeros((2, 0))
+    return np.array(splev(np.linspace(0.0, 1.0, num_samples), spline))
+
+
 def plot_step(
     axes: npt.NDArray[np.object_],
+    LD_module: LaneDetection,
     annotated_front: npt.NDArray[np.uint8],
     num_detections: int,
-    bev: npt.NDArray[np.uint8],
-    obstacle_mask_bev: npt.NDArray[np.bool_],
     gradient_unmasked: npt.NDArray[np.float64],
-    gradient_sum: npt.NDArray[np.float64],
-    maxima: npt.NDArray[np.int64],
-    lane_boundary1_points: npt.NDArray[np.int64],
-    lane_boundary2_points: npt.NDArray[np.int64],
+    splines: tuple[Spline | None, Spline | None],
     step: int,
 ) -> None:
-    """Draw object detection, the BEV with obstacles, and the edges before and after obstacle suppression.
+    """Draw object detection and lane boundaries in the front view, the BEV, and the edges before and after
+    obstacle suppression with their assigned maxima.
 
     Parameters
     ----------
     axes : (2 x 2) array of matplotlib Axes
         Grid of axes the four panels are drawn into.
+    LD_module : LaneDetection
+        Lane detector; its last_frame holds the intermediate results of the frame being drawn.
     annotated_front : (ImageHeight x ImageWidth x 3) array
         RGB front view with detections drawn by ObjectDetection.draw.
     num_detections : int
         Number of obstacles detected, shown in the title.
-    bev : (ImageHeight x ImageWidth x 3) array
-        RGB BEV image from front2bev.
-    obstacle_mask_bev : (ImageHeight x ImageWidth) array
-        BEV obstacle mask from obstacle_mask_to_bev.
     gradient_unmasked : (CutSize x ImageWidth) array
         Thresholded gradients without obstacle suppression, row 0 nearest the car.
-    gradient_sum : (CutSize x ImageWidth) array
-        Thresholded gradients with obstacle suppression, row 0 nearest the car.
-    maxima : (2 x NumMaxima) array
-        (x, y) maxima of gradient_sum from find_maxima_gradient_rowwise.
-    lane_boundary1_points : (NumBoundary1Points x 2) array
-        (x, y) maxima assigned to the left lane boundary.
-    lane_boundary2_points : (NumBoundary2Points x 2) array
-        (x, y) maxima assigned to the right lane boundary.
+    splines : tuple[Spline or None, Spline or None]
+        Left and right lane boundaries returned by lane_detection.
     step : int
         Simulation step, shown in the title.
     """
+    frame = LD_module.last_frame
+    assert frame is not None
     for ax in axes.flat:
         ax.clear()
         ax.axis('off')
 
+    # A boundary that could not be fitted this frame shows the preceding frame's spline, dashed.
+    fitted = (frame.lane_boundary1_fitted, frame.lane_boundary2_fitted)
+    samples = [sample_spline(spline) for spline in splines]
+
+    height, width = annotated_front.shape[:2]
     axes[0, 0].imshow(annotated_front)
+    for points, is_fitted in zip(samples, fitted):
+        u, v = LD_module.cut_to_front_view(points)
+        axes[0, 0].plot(u, v, color='orange', linewidth=2, linestyle='-' if is_fitted else '--')
+    axes[0, 0].set_xlim(0, width - 1)
+    axes[0, 0].set_ylim(height - 1, 0)
     axes[0, 0].set_title(f'object detection: {num_detections} obstacles (step {step})')
 
-    bev_overlay = bev.copy()
-    bev_overlay[obstacle_mask_bev] = (0.5 * bev_overlay[obstacle_mask_bev] + (127, 0, 127)).astype(np.uint8)
+    bev_overlay = frame.bev.copy()
+    if frame.obstacle_mask_bev is not None:
+        covered = frame.obstacle_mask_bev
+        bev_overlay[covered] = (0.5 * bev_overlay[covered] + (127, 0, 127)).astype(np.uint8)
     axes[0, 1].imshow(bev_overlay)
-    axes[0, 1].set_title('BEV + projected obstacles')
+    for points, is_fitted in zip(samples, fitted):
+        u, v = LD_module.cut_to_bev_pixels(points)
+        axes[0, 1].plot(u, v, color='orange', linewidth=2, linestyle='-' if is_fitted else '--')
+    axes[0, 1].set_title('BEV + projected obstacles + lane splines')
 
     # origin='lower' puts row 0 (nearest the car) at the bottom, matching the BEV panel.
     axes[1, 0].imshow(gradient_unmasked, cmap='gray', origin='lower')
     axes[1, 0].set_title('edges, no obstacle suppression')
-    axes[1, 1].imshow(gradient_sum, cmap='gray', origin='lower')
-    axes[1, 1].scatter(maxima[0], maxima[1], s=1, c='red')
-    axes[1, 1].scatter(lane_boundary1_points[:, 0], lane_boundary1_points[:, 1], s=2, c='cyan')
-    axes[1, 1].scatter(lane_boundary2_points[:, 0], lane_boundary2_points[:, 1], s=2, c='yellow')
-    axes[1, 1].set_title(f'{maxima.shape[1]} maxima, assigned L {lane_boundary1_points.shape[0]} '
-                         f'/ R {lane_boundary2_points.shape[0]}')
+
+    p1, p2 = frame.lane_boundary1_points, frame.lane_boundary2_points
+    axes[1, 1].imshow(frame.gradient_sum, cmap='gray', origin='lower')
+    axes[1, 1].scatter(frame.maxima[0], frame.maxima[1], s=1, c='red')
+    axes[1, 1].scatter(p1[:, 0], p1[:, 1], s=2, c='cyan')
+    axes[1, 1].scatter(p2[:, 0], p2[:, 1], s=2, c='yellow')
+    for points in samples:
+        axes[1, 1].plot(points[0], points[1], color='orange', linewidth=1)
+    axes[1, 1].set_xlim(0, frame.gradient_sum.shape[1] - 1)
+    axes[1, 1].set_ylim(0, frame.gradient_sum.shape[0] - 1)
+    axes[1, 1].set_title(f'{frame.maxima.shape[1]} maxima, assigned L {p1.shape[0]} / R {p2.shape[0]}')
 
     plt.gcf().canvas.draw_idle()
     plt.gcf().canvas.flush_events()
 
 
 def main() -> None:
-    """Drive an autopilot vehicle in synchronous mode and run the lane detection stages on every frame."""
+    """Drive an autopilot vehicle in synchronous mode and run obstacle and lane detection on every frame."""
     args = parse_args()
     random.seed(args.seed)
 
@@ -194,26 +227,16 @@ def main() -> None:
             front = carla_image_to_rgb(image)
             detections: DetectionResult = obj_detection.detect(front)
 
-            bev = LD_module.front2bev(front)
-            obstacle_mask_bev = LD_module.obstacle_mask_to_bev(detections.obstacle_mask())
-            gray = LD_module.cut_gray(bev)
-            gradient_sum = LD_module.edge_detection(gray, obstacle_mask_bev)
-            maxima = LD_module.find_maxima_gradient_rowwise(gradient_sum)
-            lane_boundary1_points, lane_boundary2_points, _ = LD_module.assign_lane_boundary_points(
-                gradient_sum, maxima)
+            splines = LD_module.lane_detection(front, detections.obstacle_mask())
 
             if step % 2 == 0:
                 plot_step(
                     axes,
+                    LD_module,
                     obj_detection.draw(front, detections),
                     len(detections),
-                    bev,
-                    obstacle_mask_bev,
-                    LD_module.edge_detection(gray),
-                    gradient_sum,
-                    maxima,
-                    lane_boundary1_points,
-                    lane_boundary2_points,
+                    LD_module.edge_detection(LD_module.cut_gray(LD_module.last_frame.bev)),
+                    splines,
                     step,
                 )
             step += 1
