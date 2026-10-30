@@ -6,7 +6,7 @@ from bev import SceneBEV
 from lane_detection import LaneDetection, Spline
 from object_detection import ObjectDetection
 from sim_session import CarlaSession, build_arg_parser, sample_spline
-from waypoint_prediction import waypoint_prediction
+from waypoint_prediction import target_speed_prediction, waypoint_prediction
 
 WAYPOINT_COLORS: dict[str, str] = {'center': 'white', 'smooth': 'lime'}
 
@@ -18,6 +18,8 @@ def plot_step(
     scene: npt.NDArray[np.uint8],
     splines: tuple[Spline | None, Spline | None],
     waypoints: dict[str, npt.NDArray[np.float64]],
+    target_speeds: dict[str, float],
+    speed_kmh: float,
     step: int,
 ) -> None:
     """Draw lane boundaries and waypoints in the front view and in the scene BEV.
@@ -36,6 +38,10 @@ def plot_step(
         Left and right lane boundaries.
     waypoints : dict[str, (2 x NumWaypoints) array]
         Waypoints per way_type, in cut_gray coordinates; empty when the boundaries are not known yet.
+    target_speeds : dict[str, float]
+        Target speed in km/h per way_type, shown in the legend.
+    speed_kmh : float
+        Current vehicle speed in km/h, shown in the title.
     step : int
         Simulation step, shown in the title.
     """
@@ -53,12 +59,12 @@ def plot_step(
         for way_type, points in waypoints.items():
             u, v = to_pixels(points)
             ax.plot(u, v, color=WAYPOINT_COLORS[way_type], linewidth=1, marker='o', markersize=4,
-                    label=f'{way_type} waypoints')
+                    label=f'{way_type}: {target_speeds[way_type]:.0f} km/h')
         ax.set_xlim(0, width - 1)
         ax.set_ylim(height - 1, 0)
 
-    axes[0].set_title(f'front view (step {step})')
-    axes[1].set_title('scene BEV: lane splines + waypoints')
+    axes[0].set_title(f'front view (step {step}, {speed_kmh:.0f} km/h)')
+    axes[1].set_title('scene BEV: waypoints + target speed')
     if waypoints:
         axes[1].legend(loc='upper right', fontsize=7)
 
@@ -91,15 +97,17 @@ def main() -> None:
             # lane detection
             lane1, lane2 = LD_module.lane_detection(front, detections.obstacle_mask())
 
-            # waypoint prediction; the target speed follows in unit 2C
+            # waypoint and target speed prediction
             waypoints: dict[str, npt.NDArray[np.float64]] = {}
             if lane1 is not None and lane2 is not None:
                 waypoints = {way_type: waypoint_prediction(lane1, lane2, way_type=way_type)
                              for way_type in args.way_types}
+            target_speeds = {way_type: target_speed_prediction(points) for way_type, points in waypoints.items()}
 
             if session.should_draw(step):
                 scene = scene_bev.render(front, detections, scene_bev.localize(detections))
-                plot_step(axes, LD_module, front, scene, (lane1, lane2), waypoints, step)
+                plot_step(axes, LD_module, front, scene, (lane1, lane2), waypoints, target_speeds,
+                          3.6 * session.speed_mps, step)
                 session.after_draw(step)
             step += 1
 

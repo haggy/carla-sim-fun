@@ -125,21 +125,37 @@ def waypoint_prediction(
     raise ValueError(f'unknown way_type {way_type!r}; expected "center" or "smooth"')
 
 
-def target_speed_prediction(waypoints, num_waypoints_used=5,
-                            max_speed=60, exp_constant=4.5, offset_speed=30):
-    '''
-    ##### TODO ##### (unit 2C)
-    Predict target speed given waypoints
-    Implement the function using curvature()
+def target_speed_prediction(
+    waypoints: npt.NDArray[np.float64],
+    num_waypoints_used: int = 5,
+    max_speed: float = 60,
+    exp_constant: float = 4.5,
+    offset_speed: float = 30,
+) -> float:
+    """Target speed for the predicted path: max_speed on a straight path, decaying towards offset_speed in bends.
 
-    args:
-        waypoints [2,num_waypoints]
-        num_waypoints_used (default=5)
-        max_speed (default=60)
-        exp_constant (default=4.5)
-        offset_speed (default=30)
+    Implements assignment eq. 2, v = (v_max - v_min) * exp(-K_v * |N - 2 - curvature|) + v_min. curvature() sums
+    the cosines of the N - 2 turning angles, so N - 2 - curvature is 0 for a straight path and grows with every
+    bend; for small angles each turn of theta contributes 1 - cos(theta), about theta^2 / 2.
 
-    output:
-        target_speed (float)
-    '''
-    raise NotImplementedError('target speed prediction is implemented in unit 2C')
+    Parameters
+    ----------
+    waypoints : (2 x NumWaypoints) array
+        (x, y) waypoints from waypoint_prediction, nearest first.
+    num_waypoints_used : int
+        N, the number of leading waypoints the curvature is measured over.
+    max_speed : float
+        v_max, the target speed on a straight path, in km/h.
+    exp_constant : float
+        K_v, how quickly the target speed drops with curvature.
+    offset_speed : float
+        v_min, the speed approached in the sharpest bends, in km/h.
+
+    Returns
+    -------
+    float
+        Target speed in km/h, in (offset_speed, max_speed].
+    """
+    used = waypoints[:, :num_waypoints_used]
+    bend = abs(used.shape[1] - 2 - curvature(used))
+    return float((max_speed - offset_speed) * np.exp(-exp_constant * bend) + offset_speed)
