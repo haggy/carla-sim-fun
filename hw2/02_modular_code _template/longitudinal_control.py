@@ -5,15 +5,16 @@ import numpy as np
 class LongitudinalController:
     """Longitudinal control with a discrete PID controller on the speed error (assignment eqs. 5-7).
 
-    Speeds may be in any unit as long as speed and target speed agree; the gains are tuned for km/h.
+    Speeds may be in any unit as long as speed and target speed agree; the default gains were tuned in unit 4B on
+    Town01 for speeds in km/h.
     """
 
     def __init__(
         self,
-        KP: float = 0.01,
-        KI: float = 0.0,
-        KD: float = 0.0,
-        max_error_sum: float = 100.0,
+        KP: float = 0.2,
+        KI: float = 0.01,
+        KD: float = 1.0,
+        max_error_sum: float = 80.0,
         max_action: float = 0.8,
     ) -> None:
         """Set the gains and reset the controller state.
@@ -27,7 +28,8 @@ class LongitudinalController:
         KD : float
             Derivative gain K_d, per km/h change of the error between two steps.
         max_error_sum : float
-            Bound on |sum of errors| for the integral term (anti-windup), in km/h * steps.
+            Bound on |sum of errors| for the integral term (anti-windup), in km/h * steps. The default lets the
+            integral term reach KI * max_error_sum = 0.8, the largest gas or brake value, and no more.
         max_action : float
             Largest gas or brake value sent to the car.
         """
