@@ -57,7 +57,7 @@ class LaneDetection:
         self,
         cut_size: int = 120,
         spline_smoothness: float = 100,
-        gradient_threshold: float = 10,
+        gradient_threshold: float = 8,
         distance_maxima_gradient: int = 3,
         image_size: tuple[int, int] = (240, 320),
         camera_fov_deg: float = 90.0,
@@ -71,8 +71,8 @@ class LaneDetection:
         min_lane_width_px: float = 20.0,
         min_boundary_points: int = 10,
         max_start_attempts: int = 5,
-        max_lateral_jump_px: float = 4.0,
-        max_lateral_slope: float = 0.3,
+        max_lateral_jump_px: float = 3.0,
+        max_lateral_slope: float = 0.2,
     ) -> None:
         """Configure the lane detector and precompute the front-view to BEV homography.
 
@@ -85,13 +85,14 @@ class LaneDetection:
             Number of BEV rows, counted from the car, that are kept for lane detection.
         spline_smoothness : float
             Smoothing factor `s` passed to scipy.interpolate.splprep: an upper bound on the summed squared pixel
-            distance between the boundary points and the spline. Tuned in unit 1F: accuracy is insensitive to it,
-            but below ~30 the spline follows the 1 px quantisation of the maxima and turns by 50-400 deg over 9 m;
-            from ~100 (about the number of points per boundary) it stops tracking that noise.
+            distance between the boundary points and the spline. Tuned in unit 1F on Town01: accuracy is
+            insensitive to it, but at the template's 10 the spline follows the 1 px quantisation of the maxima and
+            turns by ~40 deg over 9 m; from ~100 (about the number of points per boundary) it stops tracking that
+            noise.
         gradient_threshold : float
-            Absolute gradients below this value are zeroed during edge detection. Tuned in unit 1F against map
-            ground truth: Town01's faint, wet markings need <= 10, while Town10's high-contrast scenes do best at
-            12-14; 10 balances the two.
+            Absolute gradients below this value are zeroed during edge detection. Tuned in unit 1F against Town01
+            map ground truth: its faint, wet markings barely clear the template's 14; 7-10 is a plateau with the
+            best result at 8.
         distance_maxima_gradient : int
             Minimum pixel distance between neighbouring row-wise gradient maxima.
         image_size : tuple[int, int]
@@ -127,7 +128,7 @@ class LaneDetection:
         max_lateral_jump_px : float
             While tracing, a candidate maximum is rejected outright if its sideways offset from the boundary's
             extrapolated direction exceeds max_lateral_jump_px + max_lateral_slope * (its distance ahead of the
-            last boundary point).
+            last boundary point). Tuned with max_lateral_slope in unit 1F on Town01.
         max_lateral_slope : float
             See max_lateral_jump_px.
         """
