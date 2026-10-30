@@ -5,6 +5,7 @@ The traffic manager's autopilot is the expert. Every episode starts at a differe
 camera frame, the expert's control and the ego pose; future waypoints are derived from the poses at training time.
 To show the networks how to recover from mistakes, the autopilot is periodically switched off and the car is pushed
 off its line with a random steering offset; those steps are flagged so they are never used as labels.
+With --weather random each episode draws a weather preset, and --npcs adds traffic the expert brakes for.
 """
 from __future__ import annotations
 
@@ -21,6 +22,11 @@ import numpy.typing as npt
 from common import DATA_DIR  # noqa: F401  (also puts the template folder on the path)
 from sim_session import CarlaSession, build_arg_parser
 
+# Daytime presets that also exist in CARLA 0.9.10, which the leaderboard routes are written for.
+WEATHER_PRESETS = ('ClearNoon', 'CloudyNoon', 'WetNoon', 'WetCloudyNoon', 'SoftRainNoon', 'MidRainyNoon', 'HardRainNoon',
+                   'ClearSunset', 'CloudySunset', 'WetSunset', 'WetCloudySunset', 'SoftRainSunset', 'MidRainSunset',
+                   'HardRainSunset')
+
 
 def collect_episode(args: argparse.Namespace, seed: int, out_dir: Path) -> int:
     """Drive one autopilot episode and write it to <out_dir>/episode_<seed>_{rgb.npy,meta.npz}.
@@ -28,8 +34,8 @@ def collect_episode(args: argparse.Namespace, seed: int, out_dir: Path) -> int:
     Parameters
     ----------
     args : argparse.Namespace
-        Options from build_arg_parser plus episode_steps, save_every, perturb_every, perturb_steps and
-        perturb_steer.
+        Options from build_arg_parser plus episode_steps, save_every, perturb_every, perturb_steps, perturb_steer
+        and weather.
     seed : int
         Seed for the spawn point and the perturbations; also names the episode files.
     out_dir : Path
@@ -48,12 +54,16 @@ def collect_episode(args: argparse.Namespace, seed: int, out_dir: Path) -> int:
     speeds: list[float] = []
     controls: list[tuple[float, float, float]] = []
     perturbed: list[bool] = []
+    weather = rng.choice(WEATHER_PRESETS) if args.weather == 'random' else 'server'
 
     with CarlaSession(args) as session:
         session.attach_figure(plt.figure())
+        original_weather = session.world.get_weather()
+        if weather != 'server':
+            session.world.set_weather(getattr(carla.WeatherParameters, weather))
         tm = session.traffic_manager
         vehicle = session.vehicle
-        # Lights and other traffic are out of scope for these policies; the expert only follows the road.
+        # Lights are out of scope for these policies; the expert follows the road and brakes only for other traffic.
         tm.ignore_lights_percentage(vehicle, 100)
         tm.ignore_signs_percentage(vehicle, 100)
         tm.vehicle_percentage_speed_difference(vehicle, 0)
@@ -93,12 +103,14 @@ def collect_episode(args: argparse.Namespace, seed: int, out_dir: Path) -> int:
             if step % args.save_every == 0:
                 frames.append(front)
                 frame_steps.append(step)
+        # The weather outlives the session on the server, and every later test would run in it.
+        session.world.set_weather(original_weather)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     np.save(out_dir / f'episode_{seed:04d}_rgb.npy', np.stack(frames))
     np.savez(out_dir / f'episode_{seed:04d}_meta.npz', frame_steps=np.array(frame_steps), poses=np.array(poses),
              speeds=np.array(speeds), controls=np.array(controls, dtype=np.float32),
-             perturbed=np.array(perturbed))
+             perturbed=np.array(perturbed), weather=weather)
     return len(frames)
 
 
@@ -114,6 +126,8 @@ def main() -> None:
                         help='Steps between steering perturbations; 0 disables them.')
     parser.add_argument('--perturb-steps', type=int, default=8, help='Length of a perturbation in steps.')
     parser.add_argument('--perturb-steer', type=float, default=0.3, help='Largest steering offset of a perturbation.')
+    parser.add_argument('--weather', choices=('server', 'random'), default='server',
+                        help="'random' draws one of WEATHER_PRESETS per episode; 'server' keeps the current weather.")
     parser.add_argument('--out', type=Path, default=DATA_DIR / 'episodes')
     parser.set_defaults(npcs=0)
     args = parser.parse_args()

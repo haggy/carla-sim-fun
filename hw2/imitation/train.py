@@ -107,8 +107,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description='Train an imitation learning driving policy.')
     parser.add_argument('--input', choices=INPUT_TYPES, required=True)
     parser.add_argument('--output', choices=OUTPUT_TYPES, required=True)
-    parser.add_argument('--episodes', type=Path, default=DATA_DIR / 'episodes')
+    parser.add_argument('--episodes', type=Path, nargs='+', default=[DATA_DIR / 'episodes'],
+                        help='Episode folders; their episodes are pooled.')
     parser.add_argument('--val-episodes', type=int, default=3, help='The last N episodes (by seed) are validation.')
+    parser.add_argument('--tag', default='', help='Appended to the model name, e.g. "weather" -> rgb_control_weather.')
     parser.add_argument('--epochs', type=int, default=12)
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--lr', type=float, default=3e-4)
@@ -116,7 +118,8 @@ def main() -> None:
     parser.add_argument('--max-batches', type=int, default=0, help='Stop each epoch after N batches (smoke tests).')
     args = parser.parse_args()
 
-    episode_files = sorted(args.episodes.glob('episode_*_rgb.npy'))
+    episode_files = sorted((f for folder in args.episodes for f in folder.glob('episode_*_rgb.npy')),
+                           key=lambda f: f.name)
     if len(episode_files) <= args.val_episodes:
         raise SystemExit(f'need more than {args.val_episodes} episodes in {args.episodes}, found {len(episode_files)}')
     train_set = DrivingDataset(episode_files[:-args.val_episodes], args.input)
@@ -136,7 +139,7 @@ def main() -> None:
         train_loader = [b for _, b in zip(range(args.max_batches), train_loader)]
         val_loader = [b for _, b in zip(range(args.max_batches), val_loader)]
 
-    name = f'{args.input}_{args.output}'
+    name = f'{args.input}_{args.output}' + (f'_{args.tag}' if args.tag else '')
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     model_path = MODEL_DIR / f'{name}.pth'
     history: list[dict[str, float]] = []
