@@ -14,6 +14,7 @@ from scipy.interpolate import splev
 
 from lane_detection import LaneDetection, Spline
 from object_detection import DetectionResult, ObjectDetection
+from bev import SceneBEV
 
 from PIL import Image
 
@@ -36,13 +37,15 @@ def parse_args() -> argparse.Namespace:
     Returns
     -------
     argparse.Namespace
-        host, port, steps (0 runs until the window is closed), seed, npcs (traffic vehicle count), manual
+        host, port, town, steps (0 runs until the window is closed), seed, npcs (traffic vehicle count), manual
         (arrow-key driving instead of autopilot), snapshot_dir, snapshot_every and save (path or None).
     """
     parser = argparse.ArgumentParser(
         description='Live test of LaneDetection BEV, edge detection and obstacle detection in CARLA.')
     parser.add_argument('--host', default='localhost')
     parser.add_argument('--port', type=int, default=2000)
+    parser.add_argument('--town', default='Town01',
+                        help='Map to load if the server is on another one; the assignment allows only Town01.')
     parser.add_argument('--steps', type=int, default=0, help='Number of simulation steps; 0 runs until closed.')
     parser.add_argument('--seed', type=int, default=None, help='Seed for the spawn point choice.')
     parser.add_argument('--npcs', type=int, default=30, help='Autopilot traffic vehicles to spawn as obstacles.')
@@ -167,6 +170,8 @@ def plot_step(
     annotated_front: npt.NDArray[np.uint8],
     num_detections: int,
     gradient_unmasked: npt.NDArray[np.float64],
+    scene_bev: npt.NDArray[np.uint8],
+    num_placed: int,
     splines: tuple[Spline | None, Spline | None],
     step: int,
 ) -> None:
@@ -185,6 +190,10 @@ def plot_step(
         Number of obstacles detected, shown in the title.
     gradient_unmasked : (CutSize x ImageWidth) array
         Thresholded gradients without obstacle suppression, row 0 nearest the car.
+    scene_bev : (ImageHeight x ImageWidth x 3) array
+        Scene BEV from SceneBEV.render, without lane splines (they are drawn here so fallbacks show dashed).
+    num_placed : int
+        Number of obstacles SceneBEV placed on the ground, shown in the title.
     splines : tuple[Spline or None, Spline or None]
         Left and right lane boundaries returned by lane_detection.
     step : int
@@ -209,15 +218,11 @@ def plot_step(
     axes[0, 0].set_ylim(height - 1, 0)
     axes[0, 0].set_title(f'object detection: {num_detections} obstacles (step {step})')
 
-    bev_overlay = frame.bev.copy()
-    if frame.obstacle_mask_bev is not None:
-        covered = frame.obstacle_mask_bev
-        bev_overlay[covered] = (0.5 * bev_overlay[covered] + (127, 0, 127)).astype(np.uint8)
-    axes[0, 1].imshow(bev_overlay)
+    axes[0, 1].imshow(scene_bev)
     for points, is_fitted in zip(samples, fitted):
         u, v = LD_module.cut_to_bev_pixels(points)
         axes[0, 1].plot(u, v, color='orange', linewidth=2, linestyle='-' if is_fitted else '--')
-    axes[0, 1].set_title('BEV + projected obstacles + lane splines')
+    axes[0, 1].set_title(f'scene BEV: {num_placed} obstacles placed, grey = occluded')
 
     # origin='lower' puts row 0 (nearest the car) at the bottom, matching the BEV panel.
     axes[1, 0].imshow(gradient_unmasked, cmap='gray', origin='lower')
@@ -247,6 +252,8 @@ def main() -> None:
     client = carla.Client(args.host, args.port)
     client.set_timeout(10.0)
     world = client.get_world()
+    if args.town not in world.get_map().name:
+        world = client.load_world(args.town)
     traffic_manager = client.get_trafficmanager()
 
     original_settings = world.get_settings()
@@ -285,6 +292,7 @@ def main() -> None:
 
         LD_module = LaneDetection()
         obj_detection = ObjectDetection()
+        scene_bev = SceneBEV(LD_module)
 
         # Matplotlib binds the arrow keys to toolbar navigation and "s" to its save dialog by default, which would
         # fight the driving and snapshot keys.
@@ -312,6 +320,7 @@ def main() -> None:
             detections: DetectionResult = obj_detection.detect(front)
 
             splines = LD_module.lane_detection(front, detections.obstacle_mask())
+            obstacles = scene_bev.localize(detections)
 
             snapshot_due = args.snapshot_every > 0 and step % args.snapshot_every == 0
             if step % 2 == 0 or snapshot_due or driver.snapshot_requested:
@@ -321,6 +330,8 @@ def main() -> None:
                     obj_detection.draw(front, detections),
                     len(detections),
                     LD_module.edge_detection(LD_module.cut_gray(LD_module.last_frame.bev)),
+                    scene_bev.render(front, detections, obstacles),
+                    len(obstacles),
                     splines,
                     step,
                 )

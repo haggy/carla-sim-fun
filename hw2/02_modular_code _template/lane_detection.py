@@ -150,6 +150,8 @@ class LaneDetection:
         self.max_start_attempts = max_start_attempts
         self.max_lateral_jump_px = max_lateral_jump_px
         self.max_lateral_slope = max_lateral_slope
+        self.bev_forward_range_m = bev_forward_range_m
+        self.bev_lateral_range_m = bev_lateral_range_m
         self.H_bev2im: npt.NDArray[np.float64] = self._bev_to_image_homography(
             image_size, camera_fov_deg, camera_xyz, bev_forward_range_m, bev_lateral_range_m)
 
@@ -745,6 +747,67 @@ class LaneDetection:
         bev_pixels = self.cut_to_bev_pixels(points)
         homogeneous = self.H_bev2im @ np.vstack([bev_pixels, np.ones(bev_pixels.shape[1])])
         return homogeneous[:2] / homogeneous[2]
+
+
+    def bev_metres_per_pixel(self) -> tuple[float, float]:
+        """Ground size of one BEV pixel.
+
+        Returns
+        -------
+        tuple[float, float]
+            (forward metres per BEV row, lateral metres per BEV column).
+        """
+        height, width = self.image_size
+        return ((self.bev_forward_range_m[1] - self.bev_forward_range_m[0]) / height,
+                (self.bev_lateral_range_m[1] - self.bev_lateral_range_m[0]) / width)
+
+
+    def vehicle_to_bev_pixels(self, points: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+        """Convert ground points in the vehicle frame to BEV pixel coordinates.
+
+        Parameters
+        ----------
+        points : (2 x NumPoints) array
+            (x forward, y right) ground points in metres, relative to the vehicle origin.
+
+        Returns
+        -------
+        (2 x NumPoints) array
+            (u, v) BEV pixel coordinates; points outside the BEV range land outside the image.
+        """
+        dx, dy = self.bev_metres_per_pixel()
+        # Inverse of the pixel-centre mapping used by _bev_to_image_homography.
+        u = (points[1] - self.bev_lateral_range_m[0]) / dy - 0.5
+        v = (self.bev_forward_range_m[1] - points[0]) / dx - 0.5
+        return np.stack([u, v])
+
+
+    def image_to_vehicle(self, points: npt.NDArray[np.float64]) -> npt.NDArray[np.float64]:
+        """Back-project front-view pixels onto the ground plane.
+
+        Only valid for pixels that actually show the ground (e.g. where an obstacle touches the road); anything
+        above the ground has no single ground point.
+
+        Parameters
+        ----------
+        points : (2 x NumPoints) array
+            (u, v) front camera pixel coordinates.
+
+        Returns
+        -------
+        (2 x NumPoints) array
+            (x forward, y right) ground points in metres. Pixels at or above the horizon have no ground
+            intersection in front of the camera and return NaN.
+        """
+        homogeneous = np.linalg.solve(self.H_bev2im, np.vstack([points, np.ones(points.shape[1])]))
+        # A non-positive scale means the viewing ray meets the ground plane behind the camera, i.e. never.
+        in_front = homogeneous[2] > 0
+        bev_pixels = homogeneous[:2] / np.where(in_front, homogeneous[2], np.nan)
+        dx, dy = self.bev_metres_per_pixel()
+        return np.stack([
+            self.bev_forward_range_m[1] - (bev_pixels[1] + 0.5) * dx,
+            self.bev_lateral_range_m[0] + (bev_pixels[0] + 0.5) * dy,
+        ])
 
 
     def plot_state_lane(
