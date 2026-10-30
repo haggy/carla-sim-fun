@@ -91,3 +91,56 @@ The cause is the detected path, not the controller:
   road.
 - Damping (3C) attacks the frame-to-frame jumps. Better perception, or temporal filtering of the boundaries, is
   needed for the steady drift.
+
+## 3C: damping
+
+`stanley()` now applies eq. 4, delta(t) = delta_SC(t) - D (delta_SC(t) - delta(t-1)), where delta(t-1) is the
+(clipped) wheel angle sent in the previous step.
+
+- Rearranged, this is delta(t) = (1 - D) delta_SC(t) + D delta(t-1): a first-order low-pass filter (exponential
+  moving average) of the Stanley angle.
+- Each step moves only 1 - D of the way to the new command. At 20 Hz the time constant is -0.05 s / ln D:
+  0.04 s for D = 0.3, 0.1 s for 0.6, 0.22 s for 0.8 and 0.47 s for 0.9.
+- Run with `python test_lateral_control.py --damping D` (k = 3).
+
+### Choice of D
+
+Three spawn points (seeds 1-3), 600 steps each, k = 3; means over the seeds.
+
+Ground-truth path (the controller alone):
+
+| D | in lane | distance before leaving lane | mean abs. offset | steering jitter |
+|---:|---:|---:|---:|---:|
+| 0 | 96.9% | 131 m | 0.12 m | 0.007 |
+| **0.6** | 97.4% | 131 m | 0.11 m | 0.008 |
+| 0.9 | 55.8% | 73 m | 0.21 m | 0.012 |
+
+Detected path:
+
+| D | in lane | distance before leaving lane | total distance in 30 s | steering jitter |
+|---:|---:|---:|---:|---:|
+| 0 | 45.2% | 11 m | 38 m | 0.077 |
+| 0.3 | 63.5% | 12 m | 58 m | 0.108 |
+| **0.6** | 60.4% | 11 m | 27 m | 0.059 |
+| 0.8 | 27.4% | 5 m | 72 m | 0.057 |
+| 0.9 | 21.7% | 5 m | 85 m | 0.031 |
+
+- **Up to D = 0.6, damping is free on a clean path.** Tracking and corners are unchanged, because a 0.1 s lag is
+  small next to the car's own response.
+- **D = 0.9 is too slow.** At Town01's 90 deg turns the steering reaches the needed angle about half a second
+  late. The car overshoots the corner and, on seed 1, hits the hedge on the outside of the turn
+  (`gt_D0.9_s1_junction_overshoot.png`). The filter also lags on the way out of the corner, so the car swings past
+  the lane centre.
+- **On the detected path, damping removes the frame-to-frame flicker.**
+  - Steering jitter falls from 0.077 (D = 0) to 0.059 (0.6) and 0.031 (0.9). The full-lock-to-full-lock switching
+    of 3B becomes smoother swings (`detected_D*_s2.png`).
+  - The car is less likely to stop dead against an obstacle, so it travels further.
+  - It doesn't stay in its lane any longer: with large D it holds a wrong command for longer, drifting steadily
+    out of the lane instead of jittering around the centre.
+  - The detected-path numbers vary a lot between seeds (e.g. in-lane 9-92% for D = 0.6). With three runs per
+    setting, only the jitter trend and the failure of D >= 0.8 are reliable.
+- **Chosen: D = 0.6** (the template's value). It is the largest damping with no cost on a clean path, and it
+  removes a quarter of the steering jitter on the detected path.
+- **Damping cannot fix the underlying problem.** The detected path is wrong for several frames at a time (3B), and
+  a low-pass filter only averages those errors. Keeping the car in its lane on the detected path needs better lane
+  detection, or temporal tracking of the boundaries across frames, before the controller.

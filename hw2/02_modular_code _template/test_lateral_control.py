@@ -198,6 +198,8 @@ def main() -> None:
     """
     parser = build_arg_parser('Live test of the lateral (Stanley) controller in CARLA.', 'lateral_control_snapshots')
     parser.add_argument('--gain', type=float, default=None, help='Stanley gain k; default: the controller default.')
+    parser.add_argument('--damping', type=float, default=None,
+                        help='Damping constant D; default: the controller default.')
     parser.add_argument('--way-type', default='smooth', choices=('center', 'smooth'))
     parser.add_argument('--path', default='detected', choices=('detected', 'ground-truth'),
                         help='Follow the waypoints from the perception pipeline or the lane centre from the map.')
@@ -214,7 +216,11 @@ def main() -> None:
         LD_module = LaneDetection()
         obj_detection = ObjectDetection()
         scene_bev = SceneBEV(LD_module)
-        LatC_kwargs = {} if args.gain is None else {'gain_constant': args.gain}
+        LatC_kwargs: dict[str, float] = {}
+        if args.gain is not None:
+            LatC_kwargs['gain_constant'] = args.gain
+        if args.damping is not None:
+            LatC_kwargs['damping_constant'] = args.damping
         LatC_module = LateralController(car_position=tuple(LD_module.car_position.astype(float)),
                                         metres_per_pixel=LD_module.bev_metres_per_pixel()[1], **LatC_kwargs)
         world_map = session.world.get_map()
@@ -245,7 +251,7 @@ def main() -> None:
             if waypoints is not None:
                 target_speed = target_speed_prediction(waypoints)
 
-            # control with constant gas and no braking; the steering is held straight until a path is known
+            # control with constant gas and no braking
             steer = 0.0 if waypoints is None else LatC_module.stanley(waypoints, speed)
             throttle = args.throttle if 3.6 * speed < args.max_speed else 0.0
             control = carla.VehicleControl(throttle=throttle, steer=steer)
@@ -256,7 +262,7 @@ def main() -> None:
                       f'target speed {target_speed:4.1f} km/h')
                 scene = scene_bev.render(front, detections, scene_bev.localize(detections))
                 title = (f'step {step}, {3.6 * speed:.0f} km/h, steer {steer:+.2f}, '
-                         f'k={LatC_module.gain_constant:g}, {args.path} path')
+                         f'k={LatC_module.gain_constant:g}, D={LatC_module.damping_constant:g}, {args.path} path')
                 plot_step(axes, LD_module, front, scene, (lane1, lane2), waypoints, log, title)
                 session.after_draw(step)
             step += 1
