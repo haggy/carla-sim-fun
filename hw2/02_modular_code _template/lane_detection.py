@@ -29,9 +29,15 @@ class LaneDetection:
         image_size: tuple[int, int] = (240, 320),
         camera_fov_deg: float = 90.0,
         camera_xyz: tuple[float, float, float] = (0.0, 0.0, 2.0),
-        bev_forward_range_m: tuple[float, float] = (3.0, 21.0),
+        bev_forward_range_m: tuple[float, float] = (4.5, 22.5),
         bev_lateral_range_m: tuple[float, float] = (-12.0, 12.0),
         obstacle_margin_px: int = 3,
+        max_assignment_distance_px: float = 100.0,
+        lateral_distance_weight: float = 3.0,
+        slope_lookback_points: int = 10,
+        min_lane_width_px: float = 20.0,
+        min_boundary_points: int = 10,
+        max_start_attempts: int = 5,
     ) -> None:
         """Configure the lane detector and precompute the front-view to BEV homography.
 
@@ -56,14 +62,31 @@ class LaneDetection:
             Camera position relative to the vehicle origin, in metres (CARLA frame: x forward, y right, z up).
             The camera is assumed to have zero roll, pitch and yaw.
         bev_forward_range_m : tuple[float, float]
-            (near, far) distance ahead of the vehicle covered by the BEV image, in metres. A level camera at
-            2 m with a 90 deg FOV sees no ground closer than ~2.7 m, so a smaller near limit leaves empty rows.
+            (near, far) distance ahead of the vehicle covered by the BEV image, in metres. The default camera's
+            view of the ground is blocked by the ego hood up to ~3.8 m ahead, so the near limit sits past it;
+            otherwise the hood's outline is the first edge the lane search meets.
         bev_lateral_range_m : tuple[float, float]
             (left, right) lateral extent covered by the BEV image, in metres. Left is negative.
         obstacle_margin_px : int
             Front-view pixels the obstacle masks are grown by before they are warped to the BEV.
+        max_assignment_distance_px : float
+            A lane boundary stops growing once its nearest candidate maximum is at least this far away, measured
+            with the weighted distance described in _trace_lane_boundary.
+        lateral_distance_weight : float
+            Factor applied to the sideways offset of a candidate maximum when tracing a lane boundary.
+        slope_lookback_points : int
+            Number of most recent boundary points used to estimate the boundary's direction while tracing.
+        min_lane_width_px : float
+            The right lane boundary only takes maxima at least this far right of the left boundary in the same
+            row.
+        min_boundary_points : int
+            A traced boundary with fewer points than this is treated as a false start and retraced from the next
+            start candidate.
+        max_start_attempts : int
+            Maximum number of start points tried per lane boundary.
         """
-        self.car_position = np.array([160,0])
+        # The car sits at the bottom centre of the BEV, which is row 0 after cut_gray flips the rows.
+        self.car_position: npt.NDArray[np.int64] = np.array([image_size[1] // 2, 0])
         self.spline_smoothness = spline_smoothness
         self.cut_size = cut_size
         self.gradient_threshold = gradient_threshold
@@ -72,6 +95,12 @@ class LaneDetection:
         self.lane_boundary2_old = 0
         self.image_size = image_size
         self.obstacle_margin_px = obstacle_margin_px
+        self.max_assignment_distance_px = max_assignment_distance_px
+        self.lateral_distance_weight = lateral_distance_weight
+        self.slope_lookback_points = slope_lookback_points
+        self.min_lane_width_px = min_lane_width_px
+        self.min_boundary_points = min_boundary_points
+        self.max_start_attempts = max_start_attempts
         self.H_bev2im: npt.NDArray[np.float64] = self._bev_to_image_homography(
             image_size, camera_fov_deg, camera_xyz, bev_forward_range_m, bev_lateral_range_m)
 
@@ -321,65 +350,217 @@ class LaneDetection:
         return argmaxima
 
 
-    def find_first_lane_point(self, gradient_sum):
-        '''
-        Find the first lane_boundaries points above the car.
-        Special cases like just detecting one lane_boundary or more than two are considered. 
-        Even though there is space for improvement ;) 
+    def find_first_lane_point(
+        self,
+        gradient_sum: npt.NDArray[np.float64],
+    ) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64], bool]:
+        """Find the start points of the left and right lane boundaries in the rows closest to the car.
 
-        input:
-            gradient_sum 320x120x1
+        Rows are scanned outward from the car until one has a maximum on each side of the car. The innermost
+        maximum on each side is taken, so the two boundaries of the ego lane are chosen rather than two edges on
+        the same side (e.g. both edges of one painted line, or a lane line and the curb beyond it).
 
-        output: 
-            lane_boundary1_startpoint
-            lane_boundary2_startpoint
-            lanes_found  true if lane_boundaries were found
-        '''
-        
-        # Variable if lanes were found or not
-        lanes_found = False
-        row = 0
+        Parameters
+        ----------
+        gradient_sum : (CutSize x ImageWidth) array
+            Thresholded gradient image from edge_detection, row 0 nearest the car.
 
-        # loop through the rows
-        while not lanes_found:
-            
-            # Find peaks with min distance of at least 3 pixel 
-            argmaxima = find_peaks(gradient_sum[row],distance=3)[0]
+        Returns
+        -------
+        lane_boundary1_startpoint : (1 x 2) array
+            (x, y) start of the left lane boundary.
+        lane_boundary2_startpoint : (1 x 2) array
+            (x, y) start of the right lane boundary.
+        lanes_found : bool
+            False if no row holds any maximum; both start points are then (0, 0).
+        """
+        car_x = int(self.car_position[0])
+        width = gradient_sum.shape[1]
+        one_sided: tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]] | None = None
 
-            # if one lane_boundary is found
-            if argmaxima.shape[0] == 1:
-                lane_boundary1_startpoint = np.array([[argmaxima[0],  row]])
+        for row in range(gradient_sum.shape[0]):
+            argmaxima = find_peaks(gradient_sum[row], distance=self.distance_maxima_gradient)[0]
+            left = argmaxima[argmaxima < car_x]
+            right = argmaxima[argmaxima >= car_x]
 
-                if argmaxima[0] < 160:
-                    lane_boundary2_startpoint = np.array([[0,  row]])
-                else: 
-                    lane_boundary2_startpoint = np.array([[320,  row]])
+            if left.size and right.size:
+                return np.array([[left.max(), row]]), np.array([[right.min(), row]]), True
 
-                lanes_found = True
-            
-            # if 2 lane_boundaries are found
-            elif argmaxima.shape[0] == 2:
-                lane_boundary1_startpoint = np.array([[argmaxima[0],  row]])
-                lane_boundary2_startpoint = np.array([[argmaxima[1],  row]])
-                lanes_found = True
+            # Keep the nearest row that only shows one side, in case the other boundary never appears. The missing
+            # boundary is then parked on the image border, as in the original template.
+            if one_sided is None and left.size:
+                one_sided = np.array([[left.max(), row]]), np.array([[width - 1, row]])
+            elif one_sided is None and right.size:
+                one_sided = np.array([[0, row]]), np.array([[right.min(), row]])
 
-            # if more than 2 lane_boundaries are found
-            elif argmaxima.shape[0] > 2:
-                # if more than two maxima then take the two lanes next to the car, regarding least square
-                A = np.argsort((argmaxima - self.car_position[0])**2)
-                lane_boundary1_startpoint = np.array([[argmaxima[A[0]],  0]])
-                lane_boundary2_startpoint = np.array([[argmaxima[A[1]],  0]])
-                lanes_found = True
+        if one_sided is not None:
+            return one_sided[0], one_sided[1], True
+        return np.array([[0, 0]]), np.array([[0, 0]]), False
 
-            row += 1
-            
-            # if no lane_boundaries are found
-            if row == self.cut_size:
-                lane_boundary1_startpoint = np.array([[0,  0]])
-                lane_boundary2_startpoint = np.array([[0,  0]])
+
+    def _trace_lane_boundary(
+        self,
+        start_point: npt.NDArray[np.int64],
+        maxima: npt.NDArray[np.int64],
+        available: npt.NDArray[np.bool_],
+        left_boundary: npt.NDArray[np.int64] | None = None,
+    ) -> npt.NDArray[np.int64]:
+        """Grow one lane boundary away from the car by repeatedly appending its nearest unassigned maximum.
+
+        Only maxima further from the car than the last boundary point are candidates, so the boundary cannot fold
+        back on itself. Distances are measured relative to where the boundary is heading: the lateral offset is
+        taken from the straight-line extrapolation of the recent boundary points and weighted by
+        lateral_distance_weight. In the BEV a dashed line's next dash is ~50-80 px ahead while the neighbouring
+        lane line is ~47 px to the side, so with an unweighted distance the gap between dashes would make the
+        boundary jump lanes.
+
+        Parameters
+        ----------
+        start_point : (1 x 2) array
+            (x, y) start point from find_first_lane_point.
+        maxima : (2 x NumMaxima) array
+            (x, y) maxima from find_maxima_gradient_rowwise.
+        available : (NumMaxima,) array
+            True for maxima not yet assigned to a boundary. Updated in place, so a maximum is never assigned to
+            both boundaries.
+        left_boundary : (NumLeftPoints x 2) array or None
+            Already traced left boundary when tracing the right one. Within the left boundary's rows, the right
+            boundary only takes maxima at least min_lane_width_px to its right. Painted lines are often doubled
+            (e.g. the yellow centre line) and each paint stripe gives its own maxima, and diagonal markings lead
+            across the lane, so without this the right boundary can cross over or ride the left one's line.
+
+        Returns
+        -------
+        (NumBoundaryPoints x 2) array
+            (x, y) points of the boundary, starting with start_point and ordered away from the car.
+        """
+        points: list[npt.NDArray[np.int64]] = [start_point[0]]
+        available &= ~((maxima[0] == start_point[0, 0]) & (maxima[1] == start_point[0, 1]))
+
+        allowed: npt.NDArray[np.bool_] = available.copy()
+        if left_boundary is not None and left_boundary.shape[0] > 1:
+            # Traced boundaries advance strictly row by row, so their rows are sorted and np.interp is valid.
+            left_x = np.interp(maxima[1], left_boundary[:, 1], left_boundary[:, 0])
+            in_span = (maxima[1] >= left_boundary[0, 1]) & (maxima[1] <= left_boundary[-1, 1])
+            allowed &= ~(in_span & (maxima[0] - left_x < self.min_lane_width_px))
+
+        while True:
+            last = points[-1]
+            candidates = np.flatnonzero(available & allowed & (maxima[1] > last[1]))
+            if candidates.size == 0:
                 break
 
-        return lane_boundary1_startpoint, lane_boundary2_startpoint, lanes_found
+            anchor = points[max(len(points) - self.slope_lookback_points, 0)]
+            slope = (last[0] - anchor[0]) / (last[1] - anchor[1]) if last[1] != anchor[1] else 0.0
+
+            forward = maxima[1, candidates] - last[1]
+            lateral = maxima[0, candidates] - (last[0] + slope * forward)
+            distance = np.hypot(self.lateral_distance_weight * lateral, forward)
+
+            nearest = int(np.argmin(distance))
+            if distance[nearest] >= self.max_assignment_distance_px:
+                break
+
+            points.append(maxima[:, candidates[nearest]])
+            available[candidates[nearest]] = False
+
+        return np.array(points, dtype=np.int64)
+
+
+    def assign_lane_boundary_points(
+        self,
+        gradient_sum: npt.NDArray[np.float64],
+        maxima: npt.NDArray[np.int64],
+    ) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int64], bool]:
+        """Assign the gradient maxima to the left and right lane boundaries of the ego lane.
+
+        Parameters
+        ----------
+        gradient_sum : (CutSize x ImageWidth) array
+            Thresholded gradient image from edge_detection, row 0 nearest the car.
+        maxima : (2 x NumMaxima) array
+            (x, y) maxima of gradient_sum from find_maxima_gradient_rowwise.
+
+        Returns
+        -------
+        lane_boundary1_points : (NumBoundary1Points x 2) array
+            (x, y) points of the left lane boundary, ordered away from the car.
+        lane_boundary2_points : (NumBoundary2Points x 2) array
+            (x, y) points of the right lane boundary, ordered away from the car.
+        lanes_found : bool
+            False if find_first_lane_point found no start point; both boundaries then hold only (0, 0).
+        """
+        lane_boundary1_points, lane_boundary2_points, lanes_found = self.find_first_lane_point(gradient_sum)
+        if not lanes_found:
+            return lane_boundary1_points, lane_boundary2_points, False
+
+        car_x = int(self.car_position[0])
+        available: npt.NDArray[np.bool_] = np.ones(maxima.shape[1], dtype=bool)
+        lane_boundary1_points = self._trace_with_retries(
+            lane_boundary1_points, maxima[0] < car_x, maxima, available)
+        lane_boundary2_points = self._trace_with_retries(
+            lane_boundary2_points, maxima[0] >= car_x, maxima, available, left_boundary=lane_boundary1_points)
+        return lane_boundary1_points, lane_boundary2_points, True
+
+
+    def _trace_with_retries(
+        self,
+        first_start: npt.NDArray[np.int64],
+        on_side: npt.NDArray[np.bool_],
+        maxima: npt.NDArray[np.int64],
+        available: npt.NDArray[np.bool_],
+        left_boundary: npt.NDArray[np.int64] | None = None,
+    ) -> npt.NDArray[np.int64]:
+        """Trace a lane boundary, retrying from other start points when the trace is too short to be a lane line.
+
+        The rows nearest the car only see a few metres to each side, so the innermost maximum there is often a
+        short road marking or the end of a dash rather than the lane line itself. Further candidates are the
+        side's maxima nearest the car first and innermost within a row; maxima consumed by an earlier attempt are
+        skipped because they would only reproduce the same short trace.
+
+        Parameters
+        ----------
+        first_start : (1 x 2) array
+            (x, y) start point from find_first_lane_point, tried first.
+        on_side : (NumMaxima,) array
+            True for maxima on this boundary's side of the car; these are the retry start candidates.
+        maxima : (2 x NumMaxima) array
+            (x, y) maxima from find_maxima_gradient_rowwise.
+        available : (NumMaxima,) array
+            True for maxima not yet assigned to a boundary. Only the kept trace's maxima are marked as used.
+        left_boundary : (NumLeftPoints x 2) array or None
+            Left boundary to stay clear of when tracing the right boundary, see _trace_lane_boundary.
+
+        Returns
+        -------
+        (NumBoundaryPoints x 2) array
+            (x, y) points of the first trace with at least min_boundary_points points, else the longest trace.
+        """
+        car_x = int(self.car_position[0])
+        candidates = np.flatnonzero(on_side & available)
+        candidates = candidates[np.lexsort((np.abs(maxima[0, candidates] - car_x), maxima[1, candidates]))]
+
+        best_points: npt.NDArray[np.int64] = first_start
+        best_available: npt.NDArray[np.bool_] = available.copy()
+        tried: npt.NDArray[np.bool_] = np.zeros_like(available)
+        start = first_start
+        for _ in range(self.max_start_attempts):
+            trial_available = available.copy()
+            points = self._trace_lane_boundary(start, maxima, trial_available, left_boundary)
+            tried |= available & ~trial_available
+            if points.shape[0] > best_points.shape[0]:
+                best_points, best_available = points, trial_available
+            if points.shape[0] >= self.min_boundary_points:
+                break
+
+            remaining = candidates[~tried[candidates]]
+            if remaining.size == 0:
+                break
+            tried[remaining[0]] = True
+            start = maxima[:, remaining[0]][None]
+
+        available[:] = best_available
+        return best_points
 
 
     def lane_detection(
@@ -389,7 +570,7 @@ class LaneDetection:
     ):
         """Detect the two lane boundaries of the ego lane.
 
-        ##### TODO ##### (units 1D/1E: edge assignment and spline fitting)
+        ##### TODO ##### (unit 1E: spline fitting)
 
         Parameters
         ----------
@@ -414,26 +595,11 @@ class LaneDetection:
         gradient_sum = self.edge_detection(gray_state, obstacle_mask_bev)
         maxima = self.find_maxima_gradient_rowwise(gradient_sum)
 
-        # first lane_boundary points
-        lane_boundary1_points, lane_boundary2_points, lane_found = self.find_first_lane_point(gradient_sum)
+        lane_boundary1_points, lane_boundary2_points, lane_found = self.assign_lane_boundary_points(
+            gradient_sum, maxima)
 
         # if no lane was found,use lane_boundaries of the preceding step
         if lane_found:
-            
-            ##### TODO #####
-            #  in every iteration: 
-            # 1- find maximum/edge with the lowest distance to the last lane boundary point 
-            # 2- append maxium to lane_boundary1_points or lane_boundary2_points
-            # 3- delete maximum from maxima
-            # 4- stop loop if there is no maximum left 
-            #    or if the distance to the next one is too big (>=100)
-
-            # lane_boundary 1
-
-            # lane_boundary 2
-
-            ################
-            
 
             ##### TODO #####
             # spline fitting using scipy.interpolate.splprep 

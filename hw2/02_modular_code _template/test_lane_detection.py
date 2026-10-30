@@ -74,6 +74,8 @@ def plot_step(
     gradient_unmasked: npt.NDArray[np.float64],
     gradient_sum: npt.NDArray[np.float64],
     maxima: npt.NDArray[np.int64],
+    lane_boundary1_points: npt.NDArray[np.int64],
+    lane_boundary2_points: npt.NDArray[np.int64],
     step: int,
 ) -> None:
     """Draw object detection, the BEV with obstacles, and the edges before and after obstacle suppression.
@@ -96,6 +98,10 @@ def plot_step(
         Thresholded gradients with obstacle suppression, row 0 nearest the car.
     maxima : (2 x NumMaxima) array
         (x, y) maxima of gradient_sum from find_maxima_gradient_rowwise.
+    lane_boundary1_points : (NumBoundary1Points x 2) array
+        (x, y) maxima assigned to the left lane boundary.
+    lane_boundary2_points : (NumBoundary2Points x 2) array
+        (x, y) maxima assigned to the right lane boundary.
     step : int
         Simulation step, shown in the title.
     """
@@ -116,7 +122,10 @@ def plot_step(
     axes[1, 0].set_title('edges, no obstacle suppression')
     axes[1, 1].imshow(gradient_sum, cmap='gray', origin='lower')
     axes[1, 1].scatter(maxima[0], maxima[1], s=1, c='red')
-    axes[1, 1].set_title(f'edges w/o obstacles + {maxima.shape[1]} maxima')
+    axes[1, 1].scatter(lane_boundary1_points[:, 0], lane_boundary1_points[:, 1], s=2, c='cyan')
+    axes[1, 1].scatter(lane_boundary2_points[:, 0], lane_boundary2_points[:, 1], s=2, c='yellow')
+    axes[1, 1].set_title(f'{maxima.shape[1]} maxima, assigned L {lane_boundary1_points.shape[0]} '
+                         f'/ R {lane_boundary2_points.shape[0]}')
 
     plt.gcf().canvas.draw_idle()
     plt.gcf().canvas.flush_events()
@@ -190,6 +199,8 @@ def main() -> None:
             gray = LD_module.cut_gray(bev)
             gradient_sum = LD_module.edge_detection(gray, obstacle_mask_bev)
             maxima = LD_module.find_maxima_gradient_rowwise(gradient_sum)
+            lane_boundary1_points, lane_boundary2_points, _ = LD_module.assign_lane_boundary_points(
+                gradient_sum, maxima)
 
             if step % 2 == 0:
                 plot_step(
@@ -201,6 +212,8 @@ def main() -> None:
                     LD_module.edge_detection(gray),
                     gradient_sum,
                     maxima,
+                    lane_boundary1_points,
+                    lane_boundary2_points,
                     step,
                 )
             step += 1
