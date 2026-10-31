@@ -34,8 +34,12 @@ class DrivingPolicy(nn.Module):
             raise ValueError(f'unknown output type {output_type!r}; expected one of {OUTPUT_TYPES}')
         self.output_type = output_type
 
-        weights = torchvision.models.ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
-        self.backbone = torchvision.models.resnet18(weights=weights)
+        # resnet18() without arguments is untrained in every torchvision; `weights=` needs torchvision >= 0.13, which
+        # the leaderboard kit's Python 3.7 setup may not have.
+        if pretrained:
+            self.backbone = torchvision.models.resnet18(weights=torchvision.models.ResNet18_Weights.IMAGENET1K_V1)
+        else:
+            self.backbone = torchvision.models.resnet18()
         self.backbone.fc = nn.Identity()
         self.speed_encoder = nn.Sequential(nn.Linear(1, 32), nn.ReLU())
         num_outputs = 3 if output_type == 'control' else 2 * NUM_WAYPOINTS
@@ -67,7 +71,7 @@ class DrivingPolicy(nn.Module):
             return torch.cat([torch.tanh(out[:, :1]), torch.sigmoid(out[:, 1:])], dim=1)
         return out.view(-1, NUM_WAYPOINTS, 2)
 
-    def save(self, path: Path, input_type: str) -> None:
+    def save(self, path: Path, input_type: str, legacy_format: bool = False) -> None:
         """Save the weights together with the configuration needed to rebuild the network.
 
         Parameters
@@ -76,9 +80,11 @@ class DrivingPolicy(nn.Module):
             Output .pth file.
         input_type : str
             "rgb" or "bev", stored so evaluation feeds the right image.
+        legacy_format : bool
+            Write torch's pre-1.6 format, which every torch >= 1.0 can read (the leaderboard kit).
         """
         torch.save({'output_type': self.output_type, 'input_type': input_type, 'state_dict': self.state_dict()},
-                   str(path))
+                   str(path), _use_new_zipfile_serialization=not legacy_format)
 
     @staticmethod
     def load(path: Path, device: torch.device) -> tuple['DrivingPolicy', str]:

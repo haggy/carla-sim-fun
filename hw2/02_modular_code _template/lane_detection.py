@@ -1,4 +1,8 @@
+# The leaderboard kit may run on Python 3.7, where annotations must not be evaluated at definition time.
+from __future__ import annotations
+
 from dataclasses import dataclass
+from typing import List, Tuple
 
 import cv2
 import numpy as np
@@ -11,7 +15,8 @@ from scipy.optimize import minimize
 import time
 
 # B-spline as returned by scipy.interpolate.splprep: (knots, [x coefficients, y coefficients], degree).
-Spline = tuple[npt.NDArray[np.float64], list[npt.NDArray[np.float64]], int]
+# typing.Tuple/List because a type alias is evaluated at import, and Python 3.7 cannot subscript tuple/list.
+Spline = Tuple[npt.NDArray[np.float64], List[npt.NDArray[np.float64]], int]
 
 
 @dataclass

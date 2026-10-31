@@ -5,17 +5,17 @@ closed-loop evaluation and the leaderboard agent, so both drive with the same co
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import carla
 import numpy as np
 import numpy.typing as npt
 import torch
 
-from common import MODEL_DIR, NUM_WAYPOINTS, WAYPOINT_STEP_INTERVAL, LaneDetection, network_input
+from common import MODEL_DIR, NUM_WAYPOINTS, SIMULATION_STEP_S, WAYPOINT_STEP_INTERVAL, LaneDetection, network_input
 from lateral_control import LateralController
 from longitudinal_control import LongitudinalController
 from network import DrivingPolicy
-from object_detection import ObjectDetection
-from sim_session import FIXED_DELTA_SECONDS
 from waypoint_prediction import target_speed_prediction, waypoint_prediction
 
 # Speed of the modular pipeline's straight-road target; Town01's limit, which the expert data was also driven at.
@@ -25,17 +25,20 @@ MODULAR_MAX_SPEED_KMH = 30.0
 class Agent:
     """One driving policy: an imitation learning network or the modular pipeline."""
 
-    def __init__(self, name: str, lane_detector: LaneDetection, device: torch.device) -> None:
+    def __init__(self, name: str, lane_detector: LaneDetection, device: torch.device,
+                 model_path: Path | None = None) -> None:
         """Load the policy.
 
         Parameters
         ----------
         name : str
-            "modular" for the modular pipeline, otherwise a model name "<input>_<output>" in MODEL_DIR.
+            "modular" for the modular pipeline, otherwise a model name such as "bev_control_weather".
         lane_detector : LaneDetection
             Shared lane detector, for the BEV input and the waypoint coordinate conversions.
         device : torch.device
             Device for the network.
+        model_path : Path or None
+            Weights of a network policy; None for <name>.pth in MODEL_DIR.
         """
         self.name = name
         self.lane_detector = lane_detector
@@ -46,9 +49,11 @@ class Agent:
         self.model: DrivingPolicy | None = None
         self.input_type = 'rgb'
         if name == 'modular':
+            # Imported here because only this policy needs ultralytics, which does not support Python 3.7.
+            from object_detection import ObjectDetection
             self.object_detector = ObjectDetection()
         else:
-            self.model, self.input_type = DrivingPolicy.load(MODEL_DIR / f'{name}.pth', device)
+            self.model, self.input_type = DrivingPolicy.load(model_path or MODEL_DIR / f'{name}.pth', device)
 
     def reset(self) -> None:
         """Clear the controller state before a new drive."""
@@ -91,7 +96,7 @@ class Agent:
 
         # Predicted (forward, right) metres -> the lane detector's cut coordinates, where Stanley works.
         waypoints = self.lane_detector.bev_to_cut(self.lane_detector.vehicle_to_bev_pixels(prediction.T.astype(np.float64)))
-        horizon_s = NUM_WAYPOINTS * WAYPOINT_STEP_INTERVAL * FIXED_DELTA_SECONDS
+        horizon_s = NUM_WAYPOINTS * WAYPOINT_STEP_INTERVAL * SIMULATION_STEP_S
         path_length_m = float(np.sum(np.linalg.norm(np.diff(np.vstack([[0.0, 0.0], prediction]), axis=0), axis=1)))
         target_kmh = 3.6 * path_length_m / horizon_s
         return self._command(waypoints, speed_mps, target_kmh), waypoints

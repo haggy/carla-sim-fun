@@ -1,3 +1,6 @@
+# The leaderboard kit may run on Python 3.7, where annotations must not be evaluated at definition time.
+from __future__ import annotations
+
 import numpy as np
 import numpy.typing as npt
 

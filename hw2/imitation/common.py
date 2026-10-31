@@ -24,6 +24,9 @@ MODEL_DIR = DATA_DIR / 'models'
 # times, i.e. a 2 s horizon.
 WAYPOINT_STEP_INTERVAL = 10
 NUM_WAYPOINTS = 4
+# Seconds per simulation step: the 20 Hz of sim_session.FIXED_DELTA_SECONDS and of the leaderboard. Kept here so the
+# leaderboard kit does not need the sim harness.
+SIMULATION_STEP_S = 0.05
 
 INPUT_TYPES = ('rgb', 'bev')
 OUTPUT_TYPES = ('control', 'waypoints')
