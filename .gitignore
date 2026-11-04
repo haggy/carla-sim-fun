@@ -3,3 +3,9 @@ __pycache__
 *.png
 *.pth
 scratch.py
+
+# pytorch model files
+*.pt
+
+hw2/report_figures
+data/
